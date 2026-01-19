@@ -1,0 +1,2951 @@
+"use client";
+
+import { useState, useRef, useEffect, useCallback } from "react";
+import ReactMarkdown from "react-markdown";
+import {
+  HistoryItem,
+  SharedItem,
+  Agent1Result,
+  Agent1Response,
+  Agent2Result,
+  Agent2Response,
+  PipelineState,
+} from "./types";
+import {
+  getRelativeTime,
+  formatDate,
+  extractPaperTitle,
+  cleanPaper,
+} from "./utils";
+
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const HISTORY_KEY = "decoder_history";
+const SHARED_KEY = "decoder_shared";
+const RUNS_REMAINING_KEY = "multi_agent_runs_remaining";
+const MAX_HISTORY_ITEMS = 50;
+const ANALYSIS_TIMEOUT = 90000; // 90 seconds
+const MAX_RETRIES = 3;
+
+export default function Home() {
+  const [companyName, setCompanyName] = useState("");
+  const [website, setWebsite] = useState("");
+  const [description, setDescription] = useState("");
+  const [paperText, setPaperText] = useState("");
+  const [pdfBase64, setPdfBase64] = useState("");
+  const [pdfFileName, setPdfFileName] = useState("");
+  const [analysis, setAnalysis] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [currentSection, setCurrentSection] = useState("");
+  const [error, setError] = useState("");
+  const [useTextInput, setUseTextInput] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
+
+  // History state
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [showHistoryModal, setShowHistoryModal] = useState(false);
+  const [historySearch, setHistorySearch] = useState("");
+  const [showMobileSidebar, setShowMobileSidebar] = useState(false);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+
+  // Export state
+  const [showExportMenu, setShowExportMenu] = useState(false);
+  const [showShareToast, setShowShareToast] = useState(false);
+
+  // Usage limit state
+  const [multiAgentRunsRemaining, setMultiAgentRunsRemaining] = useState(3);
+
+  // Multi-agent pipeline state
+  const [pipelineState, setPipelineState] = useState<PipelineState>({
+    currentAgent: null,
+    startTime: null,
+    agent1Result: null,
+    agent2Result: null,
+    totalCost: 0,
+    error: null,
+  });
+  const [pipelineRunning, setPipelineRunning] = useState(false);
+  const [elapsedTime, setElapsedTime] = useState(0);
+  const [pipelinePaused, setPipelinePaused] = useState(false);
+  const [canResume, setCanResume] = useState(false);
+  const [wasAwayDuringCompletion, setWasAwayDuringCompletion] = useState(false);
+  const [pageVisible, setPageVisible] = useState(true);
+
+  // Tab and confirmation state
+  const [activeTab, setActiveTab] = useState<'quick' | 'strategic' | null>(null);
+  const [showClearConfirmAnalysis, setShowClearConfirmAnalysis] = useState(false);
+  const [pendingAnalysisType, setPendingAnalysisType] = useState<'quick' | 'strategic' | null>(null);
+
+  // Collapsible section state
+  const [expandedSections, setExpandedSections] = useState({
+    agent1: false,
+    agent2: true,
+    details: false,
+  });
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const pipelineAbortRef = useRef<AbortController | null>(null);
+  const elapsedTimeIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Load history from localStorage
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(HISTORY_KEY);
+      if (stored) {
+        setHistory(JSON.parse(stored));
+      }
+    } catch {
+      console.warn("Could not load history from localStorage");
+    }
+
+    // Load total cost from localStorage
+    try {
+      const storedCost = localStorage.getItem("total_cost");
+      if (storedCost) {
+        setPipelineState((prev) => ({
+          ...prev,
+          totalCost: parseFloat(storedCost),
+        }));
+      }
+    } catch {
+      console.warn("Could not load cost from localStorage");
+    }
+
+    // Load multi-agent runs remaining from localStorage
+    try {
+      const storedRuns = localStorage.getItem(RUNS_REMAINING_KEY);
+      if (storedRuns) {
+        setMultiAgentRunsRemaining(parseInt(storedRuns));
+      }
+    } catch {
+      console.warn("Could not load runs remaining from localStorage");
+    }
+  }, []);
+
+  // Track elapsed time during pipeline execution
+  useEffect(() => {
+    if (pipelineRunning && pipelineState.startTime) {
+      elapsedTimeIntervalRef.current = setInterval(() => {
+        setElapsedTime(Date.now() - pipelineState.startTime!);
+      }, 1000);
+    } else {
+      if (elapsedTimeIntervalRef.current) {
+        clearInterval(elapsedTimeIntervalRef.current);
+        elapsedTimeIntervalRef.current = null;
+      }
+    }
+
+    return () => {
+      if (elapsedTimeIntervalRef.current) {
+        clearInterval(elapsedTimeIntervalRef.current);
+      }
+    };
+  }, [pipelineRunning, pipelineState.startTime]);
+
+  // Check for paused analysis on mount and restore state
+  useEffect(() => {
+    const savedStateStr = sessionStorage.getItem('pausedPipelineState');
+    if (savedStateStr) {
+      try {
+        const savedState = JSON.parse(savedStateStr);
+        const { agent1Result, companyContext, timestamp } = savedState;
+
+        // Only restore if less than 24 hours old
+        if (Date.now() - timestamp < 24 * 60 * 60 * 1000) {
+          setCanResume(true);
+          setPipelineState({
+            currentAgent: null,
+            startTime: null,
+            agent1Result: agent1Result,
+            agent2Result: null,
+            totalCost: agent1Result.metadata.cost,
+            error: null,
+          });
+
+          // Restore company context
+          setCompanyName(companyContext.companyName || "");
+          setWebsite(companyContext.website || "");
+          setDescription(companyContext.description || "");
+        } else {
+          // Clear stale state
+          sessionStorage.removeItem('pausedPipelineState');
+        }
+      } catch (e) {
+        // Invalid saved state, clear it
+        sessionStorage.removeItem('pausedPipelineState');
+      }
+    }
+  }, []);
+
+  // Track page visibility for completion notifications
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      const nowVisible = !document.hidden;
+      setPageVisible(nowVisible);
+
+      if (nowVisible) {
+        // Reset title when user returns
+        document.title = "Research PM";
+
+        // Clear away indicator after 5 seconds
+        if (wasAwayDuringCompletion) {
+          setTimeout(() => setWasAwayDuringCompletion(false), 5000);
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [wasAwayDuringCompletion]);
+
+  // Auto-set active tab when results appear
+  useEffect(() => {
+    // If no tab is active but results exist, set default tab
+    if (!activeTab) {
+      if (pipelineState.agent2Result) {
+        setActiveTab('strategic');
+      } else if (analysis) {
+        setActiveTab('quick');
+      }
+    }
+  }, [analysis, pipelineState.agent2Result, activeTab]);
+
+  // Save history to localStorage
+  const saveHistory = useCallback((items: HistoryItem[]) => {
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(items));
+    } catch (e) {
+      if (e instanceof Error && e.name === "QuotaExceededError") {
+        const reduced = items.slice(0, Math.floor(items.length / 2));
+        try {
+          localStorage.setItem(HISTORY_KEY, JSON.stringify(reduced));
+          setHistory(reduced);
+        } catch {
+          console.warn("localStorage quota exceeded, history not saved");
+        }
+      }
+    }
+  }, []);
+
+  const addToHistory = useCallback(
+    (
+      analysisResult: string,
+      filename: string,
+      metadata?: {
+        claims?: Agent1Result;
+        strategic?: Agent2Result;
+      },
+      cost?: number,
+      analysisTime?: number,
+      tokens?: {
+        agent1: { input: number; output: number; total: number };
+        agent2: { input: number; output: number; total: number };
+        total: number;
+      }
+    ): HistoryItem => {
+      const newItem: HistoryItem = {
+        id: crypto.randomUUID(),
+        timestamp: Date.now(),
+        filename: filename || "Text input",
+        titlePreview: analysisResult
+          ? analysisResult.slice(0, 60).replace(/[#*\n]/g, " ").trim()
+          : "Deeper analysis completed",
+        analysis: analysisResult,
+        companyContext: {
+          companyName: companyName || undefined,
+          website: website || undefined,
+          description: description || undefined,
+        },
+        metadata,
+        cost,
+        analysisTime,
+        tokens,
+      };
+
+      setHistory((prev) => {
+        const updated = [newItem, ...prev].slice(0, MAX_HISTORY_ITEMS);
+        saveHistory(updated);
+        return updated;
+      });
+
+      return newItem;
+    },
+    [companyName, website, description, saveHistory]
+  );
+
+  const loadFromHistory = (item: HistoryItem) => {
+    setAnalysis(item.analysis);
+    setCompanyName(item.companyContext.companyName || "");
+    setWebsite(item.companyContext.website || "");
+    setDescription(item.companyContext.description || "");
+
+    // Restore pipelineState for multi-agent analyses
+    if (item.metadata?.strategic && item.metadata?.claims) {
+      setPipelineState({
+        currentAgent: null,
+        startTime: null,
+        agent1Result: {
+          claims: item.metadata.claims,
+          metadata: {
+            duration: item.analysisTime || 0,
+            tokens: { input: 0, output: 0, total: 0 },
+            cost: item.cost || 0,
+          },
+        },
+        agent2Result: {
+          strategic: item.metadata.strategic,
+          metadata: {
+            duration: 0,
+            tokens: { input: 0, output: 0, total: 0 },
+            cost: 0,
+          },
+        },
+        totalCost: item.cost || 0,
+        error: null,
+      });
+    } else {
+      // Clear pipelineState for single-agent analyses
+      setPipelineState({
+        currentAgent: null,
+        startTime: null,
+        agent1Result: null,
+        agent2Result: null,
+        totalCost: 0,
+        error: null,
+      });
+    }
+
+    setShowHistoryModal(false);
+    setShowMobileSidebar(false);
+  };
+
+  const clearHistory = () => {
+    setHistory([]);
+    try {
+      localStorage.removeItem(HISTORY_KEY);
+    } catch {
+      // Ignore
+    }
+    setShowClearConfirm(false);
+  };
+
+  async function handleFileSelect(file: File) {
+    if (file.type !== "application/pdf") {
+      setError("Please upload a PDF file");
+      return;
+    }
+
+    if (file.size > MAX_FILE_SIZE) {
+      setError("File size must be less than 10MB");
+      return;
+    }
+
+    setError("");
+    setPdfFileName(file.name);
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      const base64 = result.split(",")[1];
+      setPdfBase64(base64);
+    };
+    reader.onerror = () => {
+      setError("Failed to read file");
+      setPdfFileName("");
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function handleDrop(e: React.DragEvent) {
+    e.preventDefault();
+    setIsDragging(false);
+    const file = e.dataTransfer.files[0];
+    if (file) handleFileSelect(file);
+  }
+
+  function handleDragOver(e: React.DragEvent) {
+    e.preventDefault();
+    setIsDragging(true);
+  }
+
+  function handleDragLeave(e: React.DragEvent) {
+    e.preventDefault();
+    setIsDragging(false);
+  }
+
+  function clearPdf() {
+    setPdfBase64("");
+    setPdfFileName("");
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  async function handleAnalyze(isRetry = false) {
+    const hasContent = useTextInput ? paperText.trim() : pdfBase64;
+    if (!hasContent) {
+      setError(
+        useTextInput
+          ? "Please paste some paper text to analyze"
+          : "Please upload a PDF to analyze"
+      );
+      return;
+    }
+
+    // Check if we need to confirm clearing previous results
+    if (!isRetry && (analysis || pipelineState.agent2Result)) {
+      setPendingAnalysisType('quick');
+      setShowClearConfirmAnalysis(true);
+      return; // Wait for user confirmation
+    }
+
+    if (!isRetry) {
+      setRetryCount(0);
+    }
+
+    // Proceed with analysis - clear pending state
+    setPendingAnalysisType(null);
+
+    // Abort any existing request
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    abortControllerRef.current = new AbortController();
+
+    setIsLoading(true);
+    setError("");
+    setAnalysis("");
+    setCurrentSection("Starting analysis...");
+
+    // Set up timeout
+    const timeoutId = setTimeout(() => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+      setError("Analysis timed out. The request took longer than 90 seconds.");
+      setIsLoading(false);
+      setCurrentSection("");
+    }, ANALYSIS_TIMEOUT);
+
+    try {
+      // Normalize website URL
+      const normalizedWebsite = website.trim()
+        .replace(/^https?:\/\//, '')
+        .replace(/^www\./, '');
+
+      const response = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          paperText: useTextInput ? paperText : undefined,
+          pdfBase64: useTextInput ? undefined : pdfBase64,
+          companyName: companyName.trim() || undefined,
+          website: normalizedWebsite || undefined,
+          description: description.trim() || undefined,
+        }),
+        signal: abortControllerRef.current.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const data = await response.json();
+        if (response.status === 429) {
+          throw new Error("Rate limit exceeded. Please wait a moment and try again.");
+        } else if (response.status === 401) {
+          throw new Error("API authentication failed. Please check your API key.");
+        }
+        throw new Error(data.error || "Failed to analyze paper");
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("No response body");
+
+      const decoder = new TextDecoder();
+      let streamedText = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split("\n");
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (data.type === "section") {
+                setCurrentSection(data.section);
+              } else if (data.type === "text") {
+                streamedText += data.text;
+                setAnalysis(streamedText);
+              } else if (data.type === "done") {
+                setCurrentSection("");
+                addToHistory(streamedText, useTextInput ? extractPaperTitle(paperText) : pdfFileName);
+                setRetryCount(0);
+              } else if (data.type === "error") {
+                throw new Error(data.error);
+              }
+            } catch {
+              // Skip malformed JSON
+            }
+          }
+        }
+      }
+    } catch (err) {
+      clearTimeout(timeoutId);
+      if (err instanceof Error) {
+        if (err.name === "AbortError") {
+          // Already handled by timeout
+          return;
+        }
+        console.error("Analysis error:", err);
+        setError(err.message);
+        setRetryCount((prev) => prev + 1);
+      } else {
+        setError("Something went wrong");
+      }
+    } finally {
+      setIsLoading(false);
+      setCurrentSection("");
+    }
+  }
+
+  function handleRetry() {
+    handleAnalyze(true);
+  }
+
+  // Paper cleaning function to remove references/appendix
+  function cleanPaper(paperText: string): string {
+    let cleaned = paperText;
+
+    // Remove references section (case insensitive)
+    cleaned = cleaned.split(/\n##?\s*References/i)[0];
+
+    // Remove bibliography
+    cleaned = cleaned.split(/\n##?\s*Bibliography/i)[0];
+
+    // Remove appendix
+    cleaned = cleaned.split(/\n##?\s*Appendix/i)[0];
+
+    // Remove acknowledgments
+    cleaned = cleaned.split(/\n##?\s*Acknowledgments/i)[0];
+
+    return cleaned.trim();
+  }
+
+  // Cost logging helper
+  function logAgentCost(
+    agentName: string,
+    metadata: {
+      tokens: { input: number; output: number; total: number };
+      cost: number;
+      duration: number;
+    }
+  ) {
+    console.log(`=== ${agentName} ===`);
+    console.log(`Input tokens: ${metadata.tokens.input}`);
+    console.log(`Output tokens: ${metadata.tokens.output}`);
+    console.log(`Cost: $${metadata.cost.toFixed(4)}`);
+    console.log(`Duration: ${metadata.duration}ms`);
+    console.log("");
+    return metadata.cost;
+  }
+
+  async function runMultiAgentAnalysis() {
+    const hasContent = useTextInput ? paperText.trim() : pdfBase64;
+    if (!hasContent) {
+      setError(
+        useTextInput
+          ? "Please paste some paper text to analyze"
+          : "Please upload a PDF to analyze"
+      );
+      return;
+    }
+
+    if (!companyName.trim()) {
+      setError("Please enter a company name for multi-agent analysis");
+      return;
+    }
+
+    // Check if we need to confirm clearing previous results
+    if (analysis || pipelineState.agent2Result) {
+      setPendingAnalysisType('strategic');
+      setShowClearConfirmAnalysis(true);
+      return; // Wait for user confirmation
+    }
+
+    // Proceed with analysis - clear pending state
+    setPendingAnalysisType(null);
+
+    setPipelineRunning(true);
+    setError("");
+    setPipelineState({
+      currentAgent: 1,
+      startTime: Date.now(),
+      agent1Result: null,
+      agent2Result: null,
+      totalCost: pipelineState.totalCost,
+      error: null,
+    });
+    setElapsedTime(0);
+
+    let cumulativeCost = pipelineState.totalCost;
+
+    // Initialize abort controller for pause functionality
+    pipelineAbortRef.current = new AbortController();
+
+    try {
+      // Clean paper if text input (PDF will be handled by Agent 1 directly)
+      const cleanedPaper = useTextInput ? cleanPaper(paperText) : null;
+
+      // Agent 1: Extract claims and key excerpts
+      setPipelineState((prev) => ({ ...prev, currentAgent: 1 }));
+      console.log("Starting Agent 1: Claims & Excerpts Extractor");
+
+      const agent1Response = await fetch("/api/agent1", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          paperText: cleanedPaper,
+          pdfBase64: useTextInput ? undefined : pdfBase64,
+        }),
+        signal: pipelineAbortRef.current.signal,
+      });
+
+      if (!agent1Response.ok) {
+        const errorData = await agent1Response.json();
+        throw new Error(errorData.error || "Agent 1 failed");
+      }
+
+      const agent1Data: Agent1Response = await agent1Response.json();
+      logAgentCost("Agent 1: Claims & Excerpts Extractor", agent1Data.metadata);
+      cumulativeCost += agent1Data.metadata.cost;
+
+      // Update state with Agent 1 results
+      setPipelineState((prev) => ({
+        ...prev,
+        agent1Result: agent1Data,
+        totalCost: cumulativeCost,
+      }));
+
+      // Enable resume capability and save state
+      setCanResume(true);
+      sessionStorage.setItem('pausedPipelineState', JSON.stringify({
+        agent1Result: agent1Data,
+        companyContext: { companyName, website, description },
+        paperSource: useTextInput ? { type: 'text', paperText } : { type: 'pdf', pdfFileName, pdfBase64 },
+        timestamp: Date.now(),
+      }));
+
+      // Agent 2: Strategic & product analysis (uses excerpts, NOT full paper)
+      setPipelineState((prev) => ({ ...prev, currentAgent: 2 }));
+      console.log("Starting Agent 2: Strategic Context + Product Analyzer");
+
+      const agent2Response = await fetch("/api/agent2", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          claims: agent1Data.claims,
+          excerpts: agent1Data.claims.key_excerpts,
+          companyContext: {
+            companyName,
+            website,
+            description,
+          },
+        }),
+        signal: pipelineAbortRef.current.signal,
+      });
+
+      if (!agent2Response.ok) {
+        const errorData = await agent2Response.json();
+        throw new Error(errorData.error || "Agent 2 failed");
+      }
+
+      // Handle streaming response
+      const reader = agent2Response.body?.getReader();
+      if (!reader) {
+        throw new Error("No response body from Agent 2");
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let strategic = null;
+      let metadata = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = JSON.parse(line.slice(6));
+
+            if (data.type === "section") {
+              // Update UI with current section
+              setCurrentSection(data.section);
+            } else if (data.type === "done") {
+              strategic = data.strategic;
+              metadata = data.metadata;
+            } else if (data.type === "error") {
+              throw new Error(data.error);
+            }
+          }
+        }
+      }
+
+      if (!strategic || !metadata) {
+        throw new Error("Agent 2 did not return complete results");
+      }
+
+      const agent2Data: Agent2Response = { strategic, metadata };
+      logAgentCost("Agent 2: Strategic Context + Product Analyzer", agent2Data.metadata);
+      cumulativeCost += agent2Data.metadata.cost;
+
+      // Final state update - Pipeline complete
+      setPipelineState({
+        currentAgent: null,
+        startTime: pipelineState.startTime,
+        agent1Result: agent1Data,
+        agent2Result: agent2Data,
+        totalCost: cumulativeCost,
+        error: null,
+      });
+
+      // Set active tab to strategic
+      setActiveTab('strategic');
+
+      // Save total cost to localStorage
+      try {
+        localStorage.setItem("total_cost", cumulativeCost.toString());
+      } catch {
+        console.warn("Could not save cost to localStorage");
+      }
+
+      // Add to history with metadata
+      const totalRunCost =
+        agent1Data.metadata.cost +
+        agent2Data.metadata.cost;
+      const totalRunTime =
+        agent1Data.metadata.duration +
+        agent2Data.metadata.duration;
+
+      addToHistory(
+        "",
+        useTextInput ? extractPaperTitle(paperText) : pdfFileName,
+        {
+          claims: agent1Data.claims,
+          strategic: agent2Data.strategic,
+        },
+        totalRunCost,
+        totalRunTime,
+        {
+          agent1: agent1Data.metadata.tokens,
+          agent2: agent2Data.metadata.tokens,
+          total: agent1Data.metadata.tokens.total + agent2Data.metadata.tokens.total,
+        }
+      );
+
+      // Clear saved state and resume capability
+      sessionStorage.removeItem('pausedPipelineState');
+      setCanResume(false);
+
+      console.log("=== Pipeline Complete ===");
+      console.log(`Total cost: $${(cumulativeCost - pipelineState.totalCost).toFixed(4)}`);
+      console.log(`Total time: ${Date.now() - (pipelineState.startTime || Date.now())}ms`);
+
+      // Check if user was away and show notification
+      if (document.hidden) {
+        setWasAwayDuringCompletion(true);
+        document.title = "✓ Analysis Complete - Research PM";
+      }
+
+      // Decrement multi-agent runs remaining
+      const newRunsRemaining = Math.max(0, multiAgentRunsRemaining - 1);
+      setMultiAgentRunsRemaining(newRunsRemaining);
+      try {
+        localStorage.setItem(RUNS_REMAINING_KEY, newRunsRemaining.toString());
+      } catch {
+        console.warn("Could not save runs remaining to localStorage");
+      }
+    } catch (err: any) {
+      // Handle pause/abort
+      if (err.name === 'AbortError') {
+        setError("Analysis paused. You can resume from where you left off.");
+        setPipelineRunning(false);
+        return;
+      }
+
+      console.error("Pipeline error:", err);
+      const errorMessage = err instanceof Error ? err.message : "Pipeline failed";
+      setPipelineState((prev) => ({
+        ...prev,
+        currentAgent: null,
+        error: errorMessage,
+        totalCost: cumulativeCost,
+      }));
+      setError(errorMessage);
+
+      // Save partial cost
+      try {
+        localStorage.setItem("total_cost", cumulativeCost.toString());
+      } catch {
+        console.warn("Could not save cost to localStorage");
+      }
+    } finally {
+      setPipelineRunning(false);
+    }
+  }
+
+  function retryPipeline() {
+    runMultiAgentAnalysis();
+  }
+
+  function pausePipeline() {
+    if (pipelineAbortRef.current && pipelineRunning) {
+      pipelineAbortRef.current.abort();
+      setPipelinePaused(true);
+      setPipelineRunning(false);
+    }
+  }
+
+  // Version of runMultiAgentAnalysis that skips confirmation (called from confirmation modal)
+  async function runMultiAgentAnalysisConfirmed() {
+    const hasContent = useTextInput ? paperText.trim() : pdfBase64;
+    if (!hasContent) {
+      setError(
+        useTextInput
+          ? "Please paste some paper text to analyze"
+          : "Please upload a PDF to analyze"
+      );
+      return;
+    }
+
+    if (!companyName.trim()) {
+      setError("Please enter a company name for multi-agent analysis");
+      return;
+    }
+
+    // Clear pending state and existing results
+    setPendingAnalysisType(null);
+    setAnalysis("");
+
+    setPipelineRunning(true);
+    setError("");
+    setPipelineState({
+      currentAgent: 1,
+      startTime: Date.now(),
+      agent1Result: null,
+      agent2Result: null,
+      totalCost: pipelineState.totalCost,
+      error: null,
+    });
+    setElapsedTime(0);
+
+    let cumulativeCost = pipelineState.totalCost;
+
+    // Initialize abort controller for pause functionality
+    pipelineAbortRef.current = new AbortController();
+
+    try {
+      // Clean paper if text input (PDF will be handled by Agent 1 directly)
+      const cleanedPaper = useTextInput ? cleanPaper(paperText) : null;
+
+      // Agent 1: Extract claims and key excerpts
+      setPipelineState((prev) => ({ ...prev, currentAgent: 1 }));
+      console.log("Starting Agent 1: Claims & Excerpts Extractor");
+
+      const agent1Response = await fetch("/api/agent1", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          paperText: cleanedPaper,
+          pdfBase64: useTextInput ? undefined : pdfBase64,
+        }),
+        signal: pipelineAbortRef.current.signal,
+      });
+
+      if (!agent1Response.ok) {
+        const errorData = await agent1Response.json();
+        throw new Error(errorData.error || "Agent 1 failed");
+      }
+
+      const agent1Data: Agent1Response = await agent1Response.json();
+      logAgentCost("Agent 1: Claims & Excerpts Extractor", agent1Data.metadata);
+      cumulativeCost += agent1Data.metadata.cost;
+
+      // Update state with Agent 1 results
+      setPipelineState((prev) => ({
+        ...prev,
+        agent1Result: agent1Data,
+        totalCost: cumulativeCost,
+      }));
+
+      // Enable resume capability and save state
+      setCanResume(true);
+      sessionStorage.setItem('pausedPipelineState', JSON.stringify({
+        agent1Result: agent1Data,
+        companyContext: { companyName, website, description },
+        paperSource: useTextInput ? { type: 'text', paperText } : { type: 'pdf', pdfFileName, pdfBase64 },
+        timestamp: Date.now(),
+      }));
+
+      // Agent 2: Strategic & product analysis (uses excerpts, NOT full paper)
+      setPipelineState((prev) => ({ ...prev, currentAgent: 2 }));
+      console.log("Starting Agent 2: Strategic Context + Product Analyzer");
+
+      const agent2Response = await fetch("/api/agent2", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          claims: agent1Data.claims,
+          excerpts: agent1Data.claims.key_excerpts,
+          companyContext: {
+            companyName,
+            website,
+            description,
+          },
+        }),
+        signal: pipelineAbortRef.current.signal,
+      });
+
+      if (!agent2Response.ok) {
+        const errorData = await agent2Response.json();
+        throw new Error(errorData.error || "Agent 2 failed");
+      }
+
+      // Handle streaming response
+      const reader = agent2Response.body?.getReader();
+      if (!reader) {
+        throw new Error("No response body from Agent 2");
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let strategic = null;
+      let metadata = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = JSON.parse(line.slice(6));
+
+            if (data.type === "section") {
+              // Update UI with current section
+              setCurrentSection(data.section);
+            } else if (data.type === "done") {
+              strategic = data.strategic;
+              metadata = data.metadata;
+            } else if (data.type === "error") {
+              throw new Error(data.error);
+            }
+          }
+        }
+      }
+
+      if (!strategic || !metadata) {
+        throw new Error("Agent 2 did not return complete results");
+      }
+
+      const agent2Data: Agent2Response = { strategic, metadata };
+      logAgentCost("Agent 2: Strategic Context + Product Analyzer", agent2Data.metadata);
+      cumulativeCost += agent2Data.metadata.cost;
+
+      // Final state update - Pipeline complete
+      setPipelineState({
+        currentAgent: null,
+        startTime: pipelineState.startTime,
+        agent1Result: agent1Data,
+        agent2Result: agent2Data,
+        totalCost: cumulativeCost,
+        error: null,
+      });
+
+      // Set active tab to strategic
+      setActiveTab('strategic');
+
+      // Save total cost to localStorage
+      try {
+        localStorage.setItem("total_cost", cumulativeCost.toString());
+      } catch {
+        console.warn("Could not save cost to localStorage");
+      }
+
+      // Add to history with metadata
+      const totalRunCost =
+        agent1Data.metadata.cost +
+        agent2Data.metadata.cost;
+      const totalRunTime =
+        agent1Data.metadata.duration +
+        agent2Data.metadata.duration;
+
+      addToHistory(
+        "",
+        useTextInput ? extractPaperTitle(paperText) : pdfFileName,
+        {
+          claims: agent1Data.claims,
+          strategic: agent2Data.strategic,
+        },
+        totalRunCost,
+        totalRunTime,
+        {
+          agent1: agent1Data.metadata.tokens,
+          agent2: agent2Data.metadata.tokens,
+          total: agent1Data.metadata.tokens.total + agent2Data.metadata.tokens.total,
+        }
+      );
+
+      // Clear saved state and resume capability
+      sessionStorage.removeItem('pausedPipelineState');
+      setCanResume(false);
+
+      console.log("=== Pipeline Complete ===");
+      console.log(`Total cost: $${(cumulativeCost - pipelineState.totalCost).toFixed(4)}`);
+      console.log(`Total time: ${Date.now() - (pipelineState.startTime || Date.now())}ms`);
+
+      // Check if user was away and show notification
+      if (document.hidden) {
+        setWasAwayDuringCompletion(true);
+        document.title = "✓ Analysis Complete - Research PM";
+      }
+
+      // Decrement multi-agent runs remaining
+      const newRunsRemaining = Math.max(0, multiAgentRunsRemaining - 1);
+      setMultiAgentRunsRemaining(newRunsRemaining);
+      try {
+        localStorage.setItem(RUNS_REMAINING_KEY, newRunsRemaining.toString());
+      } catch {
+        console.warn("Could not save runs remaining to localStorage");
+      }
+    } catch (err: any) {
+      // Handle pause/abort
+      if (err.name === 'AbortError') {
+        setError("Analysis paused. You can resume from where you left off.");
+        setPipelineRunning(false);
+        return;
+      }
+
+      console.error("Pipeline error:", err);
+      const errorMessage = err instanceof Error ? err.message : "Pipeline failed";
+      setPipelineState((prev) => ({
+        ...prev,
+        currentAgent: null,
+        error: errorMessage,
+        totalCost: cumulativeCost,
+      }));
+      setError(errorMessage);
+
+      // Save partial cost
+      try {
+        localStorage.setItem("total_cost", cumulativeCost.toString());
+      } catch {
+        console.warn("Could not save cost to localStorage");
+      }
+    } finally {
+      setPipelineRunning(false);
+    }
+  }
+
+  async function resumePipeline() {
+    // Check if we have saved state
+    const savedStateStr = sessionStorage.getItem('pausedPipelineState');
+    if (!savedStateStr) {
+      setError("No paused analysis found to resume");
+      return;
+    }
+
+    try {
+      const savedState = JSON.parse(savedStateStr);
+      const { agent1Result, companyContext, timestamp } = savedState;
+
+      // Resume from Agent 2
+      setPipelineRunning(true);
+      setPipelinePaused(false);
+      setError("");
+      setPipelineState({
+        currentAgent: 2,
+        startTime: Date.now(),
+        agent1Result: agent1Result,
+        agent2Result: null,
+        totalCost: agent1Result.metadata.cost,
+        error: null,
+      });
+
+      pipelineAbortRef.current = new AbortController();
+
+      // Extract key excerpts
+      const keyExcerpts = agent1Result.claims.key_excerpts || [];
+
+      // Run Agent 2
+      const agent2Response = await fetch("/api/agent2", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          claims: agent1Result.claims,
+          excerpts: keyExcerpts,
+          companyContext: companyContext,
+        }),
+        signal: pipelineAbortRef.current.signal,
+      });
+
+      if (!agent2Response.ok) {
+        throw new Error(`Agent 2 failed: ${agent2Response.statusText}`);
+      }
+
+      // Handle streaming response
+      const reader = agent2Response.body?.getReader();
+      if (!reader) {
+        throw new Error("No response body from Agent 2");
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let strategic = null;
+      let metadata = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = JSON.parse(line.slice(6));
+
+            if (data.type === "section") {
+              setCurrentSection(data.section);
+            } else if (data.type === "done") {
+              strategic = data.strategic;
+              metadata = data.metadata;
+            } else if (data.type === "error") {
+              throw new Error(data.error);
+            }
+          }
+        }
+      }
+
+      if (!strategic || !metadata) {
+        throw new Error("Agent 2 did not return complete results");
+      }
+
+      const agent2Data = { strategic, metadata };
+
+      // Update state
+      setPipelineState({
+        currentAgent: null,
+        startTime: null,
+        agent1Result: agent1Result,
+        agent2Result: agent2Data,
+        totalCost: agent1Result.metadata.cost + agent2Data.metadata.cost,
+        error: null,
+      });
+
+      // Clear saved state
+      sessionStorage.removeItem('pausedPipelineState');
+      setCanResume(false);
+
+      // Add to history (reconstruct paper title from saved state)
+      const paperTitle = savedState.paperSource.type === 'text'
+        ? extractPaperTitle(savedState.paperSource.paperText)
+        : savedState.paperSource.pdfFileName;
+
+      addToHistory(
+        "",
+        paperTitle,
+        {
+          claims: agent1Result.claims,
+          strategic: agent2Data.strategic,
+        },
+        agent1Result.metadata.cost + agent2Data.metadata.cost,
+        agent1Result.metadata.duration + agent2Data.metadata.duration,
+        {
+          agent1: agent1Result.metadata.tokens,
+          agent2: agent2Data.metadata.tokens,
+          total: agent1Result.metadata.tokens.total + agent2Data.metadata.tokens.total,
+        }
+      );
+
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        setError("Analysis paused again");
+        return;
+      }
+      setError(error instanceof Error ? error.message : "Failed to resume analysis");
+    } finally {
+      setPipelineRunning(false);
+    }
+  }
+
+  // Share functionality
+  function handleShare() {
+    if (!analysis) return;
+
+    const shareItem: SharedItem = {
+      id: crypto.randomUUID(),
+      timestamp: Date.now(),
+      filename: useTextInput ? extractPaperTitle(paperText) : pdfFileName,
+      titlePreview: analysis.slice(0, 60).replace(/[#*\n]/g, " ").trim(),
+      analysis,
+      companyContext: { companyName, website, description },
+      expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000, // 30 days
+    };
+
+    try {
+      const stored = localStorage.getItem(SHARED_KEY);
+      const shared: SharedItem[] = stored ? JSON.parse(stored) : [];
+      // Remove expired items
+      const valid = shared.filter((s) => s.expiresAt > Date.now());
+      valid.push(shareItem);
+      localStorage.setItem(SHARED_KEY, JSON.stringify(valid));
+
+      const url = `${window.location.origin}/share/${shareItem.id}`;
+      navigator.clipboard.writeText(url);
+      setShowShareToast(true);
+      setTimeout(() => setShowShareToast(false), 3000);
+    } catch {
+      setError("Failed to create share link");
+    }
+  }
+
+  // Generate formatted markdown from strategic analysis
+  function generateStrategicMarkdown(strategic: Agent2Result): string {
+    const { internal_assessment, competitive_landscape, product_implications } = strategic;
+
+    return `# Executive Summary
+
+## Strategic Fit: ${internal_assessment.strategic_fit}
+
+${internal_assessment.strategic_fit_reasoning}
+
+**Capability Overlap:** ${internal_assessment.capability_overlap_pct}% match with current capabilities
+
+---
+
+## Key Findings
+
+### Internal Assessment
+
+**Existing Capabilities:**
+${internal_assessment.existing_capabilities}
+
+**Resource Gap:**
+${internal_assessment.resource_gap}
+
+---
+
+### Market Position
+
+**Market Timing:** ${competitive_landscape.market_timing}
+
+${competitive_landscape.market_timing_reasoning}
+
+**Competitors Identified:**
+${competitive_landscape.competitors_found.map(c => `- ${c}`).join('\n')}
+
+**Differentiation Opportunities:**
+${competitive_landscape.differentiation_opportunities.map(o => `- ${o}`).join('\n')}
+
+---
+
+## Product Opportunities
+
+${product_implications.opportunities.map((opp, idx) => `
+### ${idx + 1}. ${opp.product_idea}
+
+- **Target Customer:** ${opp.target_customer}
+- **Value Proposition:** ${opp.value_proposition}
+- **Differentiation:** ${opp.differentiation}
+`).join('\n')}
+
+---
+
+## Build Assessment
+
+**Technical Complexity:** ${product_implications.build_assessment.technical_complexity}
+**Estimated Timeline:** ${product_implications.build_assessment.estimated_timeline}
+
+**Team Requirements:**
+${product_implications.build_assessment.team_requirements}
+
+**Infrastructure Needs:**
+${product_implications.build_assessment.infrastructure_needs}
+
+**Key Challenges:**
+${product_implications.build_assessment.key_challenges.map(c => `- ${c}`).join('\n')}
+
+---
+
+## Market Fit Analysis
+
+**Target Segment:** ${product_implications.market_fit.target_segment}
+
+**Competitive Positioning:** ${product_implications.market_fit.competitive_positioning}
+
+**Pricing Strategy:** ${product_implications.market_fit.pricing_strategy}
+
+**Adoption Barriers:**
+${product_implications.market_fit.adoption_barriers.map(b => `- ${b}`).join('\n')}
+
+---
+
+## Risk Assessment
+
+### Technical Risks
+${product_implications.risks.technical.map(r => `- ${r}`).join('\n')}
+
+### Market Risks
+${product_implications.risks.market.map(r => `- ${r}`).join('\n')}
+
+${product_implications.risks.regulatory.length > 0 ? `### Regulatory Risks\n${product_implications.risks.regulatory.map(r => `- ${r}`).join('\n')}` : ''}
+
+---
+
+## Competitive Intelligence
+
+${competitive_landscape.competitor_details.map(comp => `
+### ${comp.company}
+- **Status:** ${comp.status}
+- **Timeline:** ${comp.timeline}
+- **Sources:** ${comp.sources.join(', ')}
+`).join('\n')}
+`;
+  }
+
+  // Export functionality
+  function exportMarkdown() {
+    let content = "";
+    let filename = "";
+
+    // Determine what to export based on active tab
+    if (activeTab === 'strategic' && pipelineState.agent2Result) {
+      const agent2Data: Agent2Response = pipelineState.agent2Result;
+      // Export multi-agent strategic analysis
+      content = generateStrategicMarkdown(agent2Data.strategic);
+      filename = `${(pdfFileName || "analysis").replace(/\.pdf$/, "")}-strategic-analysis.md`;
+    } else if (activeTab === 'quick' && analysis) {
+      // Export quick analysis
+      content = analysis;
+      filename = `${(pdfFileName || "analysis").replace(/\.pdf$/, "")}-quick-analysis.md`;
+    } else {
+      // No active analysis to export
+      setError("No analysis to export");
+      return;
+    }
+
+    // Add header with context
+    const contextParts = [];
+    if (companyName) contextParts.push(`Company: ${companyName}`);
+    if (website) contextParts.push(`Website: ${website}`);
+    if (description) contextParts.push(`Description: ${description}`);
+
+    const markdown = `# Analysis: ${useTextInput ? extractPaperTitle(paperText) : pdfFileName}
+${contextParts.length > 0 ? `Company Context: ${contextParts.join(", ")}` : ""}
+Generated: ${formatDate(Date.now())}
+Type: ${activeTab === 'strategic' ? 'Strategic Analysis' : 'Quick Analysis'}
+
+---
+
+${content}
+`;
+
+    const blob = new Blob([markdown], { type: "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+    setShowExportMenu(false);
+  }
+
+  function exportPdf() {
+    setShowExportMenu(false);
+    window.print();
+  }
+
+  const inputClassName =
+    "w-full p-3 border border-stone-300 dark:border-stone-600 rounded-lg bg-white dark:bg-stone-800 text-stone-900 dark:text-stone-100 placeholder-stone-400 focus:ring-2 focus:ring-amber-600 focus:border-transparent";
+
+  const recentHistory = history.slice(0, 10);
+  const filteredHistory = history.filter(
+    (item) =>
+      item.filename.toLowerCase().includes(historySearch.toLowerCase()) ||
+      item.titlePreview.toLowerCase().includes(historySearch.toLowerCase())
+  );
+
+  return (
+    <>
+      {/* Print styles */}
+      <style jsx global>{`
+        @media print {
+          .no-print { display: none !important; }
+          aside { display: none !important; }
+          body {
+            font-family: Georgia, serif;
+            margin: 0;
+            padding: 0.5in;
+            background: white !important;
+            color: black !important;
+          }
+          .print-only { display: block !important; }
+          .analysis-results {
+            border: none !important;
+            box-shadow: none !important;
+            padding: 0 !important;
+            margin: 0 !important;
+          }
+          .print-content {
+            max-width: 100% !important;
+            margin: 0 !important;
+            padding: 0 !important;
+          }
+          h1, h2, h3 { page-break-after: avoid; }
+          ul, ol, p { page-break-inside: avoid; }
+          * { color: black !important; background: white !important; }
+          .border-l-4 { border-left-color: #666 !important; }
+        }
+        .print-only { display: none; }
+      `}</style>
+
+      <div className="min-h-screen bg-stone-100 dark:bg-stone-900 print:bg-white">
+        {/* Print header */}
+        <div className="print-only mb-8">
+          <h1 className="text-2xl font-bold">{pdfFileName || "Analysis"}</h1>
+          <p className="text-sm text-gray-600">Generated: {formatDate(Date.now())}</p>
+          {(companyName || website || description) && (
+            <p className="text-sm text-gray-600">
+              Context: {[companyName, website, description].filter(Boolean).join(" | ")}
+            </p>
+          )}
+        </div>
+
+        <div className="flex">
+          {/* Main Content */}
+          <main className="flex-1 py-12 px-4 lg:mr-[300px] print:mr-0 print:py-0">
+            <div className="max-w-3xl mx-auto print-content">
+              {/* Header - hidden in print */}
+              <div className="flex items-center justify-between mb-2 no-print">
+                <h1 className="text-3xl font-bold text-stone-900 dark:text-stone-100">
+                  Decoder
+                </h1>
+                <button
+                  onClick={() => setShowMobileSidebar(true)}
+                  className="lg:hidden p-2 text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-100"
+                  aria-label="Open history"
+                >
+                  <svg className="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 12h16M4 18h16" />
+                  </svg>
+                </button>
+              </div>
+              <p className="text-stone-600 dark:text-stone-400 mb-8 no-print">
+                Analyze AI research papers and extract product implications
+              </p>
+
+              <div className="space-y-6">
+                {/* Company Context - hidden in print */}
+                <div className="p-4 bg-white dark:bg-stone-800 border border-stone-200 dark:border-stone-700 rounded-lg no-print">
+                  <h2 className="text-sm font-medium text-stone-700 dark:text-stone-300 mb-4">
+                    Company Context <span className="text-stone-400 font-normal">(optional)</span>
+                  </h2>
+                  <div className="space-y-4">
+                    <div>
+                      <label htmlFor="companyName" className="block text-sm text-stone-600 dark:text-stone-400 mb-1">
+                        Company Name <span className="text-red-500">*</span>
+                      </label>
+                      <input
+                        type="text"
+                        id="companyName"
+                        value={companyName}
+                        onChange={(e) => setCompanyName(e.target.value)}
+                        placeholder="e.g., Anthropic, OpenAI, Mercury"
+                        className={inputClassName}
+                        disabled={isLoading}
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="website" className="block text-sm text-stone-600 dark:text-stone-400 mb-1">
+                        Website
+                      </label>
+                      <input
+                        type="text"
+                        id="website"
+                        value={website}
+                        onChange={(e) => setWebsite(e.target.value)}
+                        placeholder="e.g., anthropic.com"
+                        className={inputClassName}
+                        disabled={isLoading}
+                      />
+                      <p className="text-xs text-stone-500 dark:text-stone-400 mt-1">
+                        Recommended - helps identify the correct company
+                      </p>
+                    </div>
+                    <div>
+                      <label htmlFor="description" className="block text-sm text-stone-600 dark:text-stone-400 mb-1">
+                        Description
+                      </label>
+                      <textarea
+                        id="description"
+                        value={description}
+                        onChange={(e) => setDescription(e.target.value)}
+                        placeholder="What does your company do?"
+                        rows={2}
+                        className={inputClassName}
+                        disabled={isLoading}
+                      />
+                      <p className="text-xs text-stone-500 dark:text-stone-400 mt-1">
+                        Example: &apos;AI safety research company&apos; or &apos;Fintech for startups&apos;
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Paper Input - hidden in print */}
+                <div className="p-4 bg-white dark:bg-stone-800 border border-stone-200 dark:border-stone-700 rounded-lg no-print">
+                  <div className="flex items-center justify-between mb-4">
+                    <h2 className="text-sm font-medium text-stone-700 dark:text-stone-300">Research Paper</h2>
+                    <button
+                      onClick={() => { setUseTextInput(!useTextInput); setError(""); }}
+                      className="text-sm text-[#D97757] hover:text-[#C4684A] font-medium"
+                      disabled={isLoading}
+                    >
+                      {useTextInput ? "Upload PDF instead" : "Use text instead"}
+                    </button>
+                  </div>
+
+                  {useTextInput ? (
+                    <textarea
+                      value={paperText}
+                      onChange={(e) => setPaperText(e.target.value)}
+                      placeholder="Paste the full text or abstract of a research paper here..."
+                      className="w-full h-48 p-4 border border-stone-300 dark:border-stone-600 rounded-lg bg-white dark:bg-stone-800 text-stone-900 dark:text-stone-100 placeholder-stone-400 focus:ring-2 focus:ring-amber-600 focus:border-transparent resize-y text-sm"
+                      disabled={isLoading}
+                    />
+                  ) : (
+                    <div className="space-y-4">
+                      {!pdfFileName && (
+                        <div
+                          onDrop={handleDrop}
+                          onDragOver={handleDragOver}
+                          onDragLeave={handleDragLeave}
+                          className={`relative border-2 border-dashed rounded-lg p-8 text-center transition-colors min-h-[120px] ${
+                            isDragging
+                              ? "border-[#D97757] bg-amber-50 dark:bg-amber-900/20"
+                              : "border-stone-300 dark:border-stone-600 hover:border-[#D97757]"
+                          } ${isLoading ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}`}
+                        >
+                          <input
+                            ref={fileInputRef}
+                            type="file"
+                            accept=".pdf,application/pdf"
+                            onChange={(e) => {
+                              const file = e.target.files?.[0];
+                              if (file) handleFileSelect(file);
+                            }}
+                            disabled={isLoading}
+                            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-not-allowed"
+                          />
+                          <svg className="mx-auto h-12 w-12 text-stone-400" stroke="currentColor" fill="none" viewBox="0 0 48 48">
+                            <path d="M28 8H12a4 4 0 00-4 4v20m0 0v4a4 4 0 004 4h20a4 4 0 004-4V20m-24 16l8-8m0 0l8 8m-8-8v16M36 20V12a4 4 0 00-4-4h-4" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                          <p className="mt-2 text-sm text-stone-600 dark:text-stone-400">
+                            <span className="font-medium text-[#D97757]">Drop PDF here</span> or click to upload
+                          </p>
+                          <p className="mt-1 text-xs text-stone-500">PDF only, max 10MB</p>
+                        </div>
+                      )}
+
+                      {pdfFileName && (
+                        <div className="flex items-center justify-between p-3 bg-stone-50 dark:bg-stone-900 border border-stone-200 dark:border-stone-700 rounded-lg">
+                          <div className="flex items-center gap-3">
+                            <svg className="h-8 w-8 text-[#D97757]" fill="currentColor" viewBox="0 0 20 20">
+                              <path fillRule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" clipRule="evenodd" />
+                            </svg>
+                            <div>
+                              <div className="text-sm font-medium text-stone-700 dark:text-stone-300">{pdfFileName}</div>
+                              <div className="text-xs text-stone-500">Ready to analyze</div>
+                            </div>
+                          </div>
+                          <button onClick={clearPdf} disabled={isLoading} className="p-1 text-stone-400 hover:text-stone-600 dark:hover:text-stone-300">
+                            <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* Analyze Buttons - hidden in print */}
+                <div className="flex flex-col sm:flex-row gap-3 no-print">
+                  <button
+                    onClick={() => handleAnalyze()}
+                    disabled={isLoading || pipelineRunning}
+                    className="flex-1 sm:flex-none px-6 py-3 min-h-[44px] bg-[#D97757] text-white font-medium rounded-lg hover:bg-[#C4684A] disabled:bg-[#D97757]/50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {isLoading ? "Analyzing..." : "Quick Analysis"}
+                  </button>
+                  <button
+                    onClick={runMultiAgentAnalysis}
+                    disabled={isLoading || pipelineRunning || multiAgentRunsRemaining <= 0}
+                    className="flex-1 sm:flex-none px-6 py-3 min-h-[44px] bg-stone-900 dark:bg-stone-100 text-white dark:text-stone-900 font-medium rounded-lg hover:bg-stone-800 dark:hover:bg-stone-200 disabled:bg-stone-900/50 dark:disabled:bg-stone-100/50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {pipelineRunning
+                      ? "Running Pipeline..."
+                      : multiAgentRunsRemaining > 0
+                      ? `Deeper Analysis (${multiAgentRunsRemaining} remaining)`
+                      : "Deeper Analysis (limit reached)"}
+                  </button>
+                </div>
+
+                {/* Loading State - hidden in print */}
+                {isLoading && currentSection && (
+                  <div className="flex items-center gap-3 p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg no-print">
+                    <svg className="animate-spin h-5 w-5 text-[#D97757]" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                    </svg>
+                    <span className="text-stone-700 dark:text-amber-100 font-medium">{currentSection}</span>
+                  </div>
+                )}
+
+                {/* Tab Switcher - shown when at least one analysis exists */}
+                {(analysis || pipelineState.agent2Result) && !pipelineRunning && (
+                  <div className="flex gap-2 border-b border-stone-200 dark:border-stone-700 mb-6 no-print">
+                    {/* Quick Analysis Tab */}
+                    {analysis && (
+                      <button
+                        onClick={() => setActiveTab('quick')}
+                        className={`px-4 py-3 font-medium transition-colors border-b-2 ${
+                          activeTab === 'quick'
+                            ? 'border-amber-600 text-amber-600 dark:text-amber-500'
+                            : 'border-transparent text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-200'
+                        }`}
+                      >
+                        Quick Analysis
+                        <span className="ml-2 px-2 py-0.5 text-xs bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 rounded-full">
+                          Ready
+                        </span>
+                      </button>
+                    )}
+
+                    {/* Strategic Analysis Tab */}
+                    {pipelineState.agent2Result && (
+                      <button
+                        onClick={() => setActiveTab('strategic')}
+                        className={`px-4 py-3 font-medium transition-colors border-b-2 ${
+                          activeTab === 'strategic'
+                            ? 'border-amber-600 text-amber-600 dark:text-amber-500'
+                            : 'border-transparent text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-200'
+                        }`}
+                      >
+                        Strategic Analysis
+                        <span className="ml-2 px-2 py-0.5 text-xs bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 rounded-full">
+                          Ready
+                        </span>
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {/* Completion Banner - Show when user returns after analysis completed */}
+                {wasAwayDuringCompletion && (
+                  <div className="mb-4 p-4 bg-green-50 dark:bg-green-900/20 border-l-4 border-green-500 rounded-r-lg animate-pulse no-print">
+                    <div className="flex items-center">
+                      <div className="flex-shrink-0">
+                        <svg className="h-5 w-5 text-green-400" fill="currentColor" viewBox="0 0 20 20">
+                          <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                        </svg>
+                      </div>
+                      <div className="ml-3">
+                        <p className="text-sm font-medium text-green-800 dark:text-green-200">
+                          Your analysis completed while you were away!
+                        </p>
+                      </div>
+                      <div className="ml-auto">
+                        <button
+                          onClick={() => setWasAwayDuringCompletion(false)}
+                          className="text-green-500 hover:text-green-700 dark:text-green-400 dark:hover:text-green-300"
+                        >
+                          <svg className="h-5 w-5" fill="currentColor" viewBox="0 0 20 20">
+                            <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Pipeline Loading State - hidden in print */}
+                {pipelineRunning && pipelineState.currentAgent && (
+                  <div className="p-4 bg-blue-50 dark:bg-blue-900/20 border-l-4 border-blue-500 rounded-lg no-print">
+                    <div className="flex items-center justify-between">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-3 mb-2">
+                          <svg className="animate-spin h-5 w-5 text-blue-600" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                          </svg>
+                          <span className="text-blue-900 dark:text-blue-100 font-medium">
+                            {pipelineState.currentAgent === 1 && "Extracting claims and key excerpts..."}
+                            {pipelineState.currentAgent === 2 && "Analyzing product implications..."}
+                          </span>
+                        </div>
+                        <div className="text-sm text-blue-700 dark:text-blue-300 ml-8">
+                          Step {pipelineState.currentAgent} of 2 • Elapsed: {Math.floor(elapsedTime / 1000)}s
+                        </div>
+
+                        {/* Token Display - Show completed agents */}
+                        {pipelineState.agent1Result && (
+                          <div className="text-xs text-blue-600 dark:text-blue-400 mt-2 ml-8 flex items-center gap-4">
+                            <span className="font-medium">Agent 1 Complete:</span>
+                            <span>{pipelineState.agent1Result.metadata.tokens.input.toLocaleString()} in</span>
+                            <span>{pipelineState.agent1Result.metadata.tokens.output.toLocaleString()} out</span>
+                            <span className="text-blue-500">• ${pipelineState.agent1Result.metadata.cost.toFixed(4)}</span>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Pause Button */}
+                      <button
+                        onClick={pausePipeline}
+                        className="ml-4 px-4 py-2 bg-yellow-500 hover:bg-yellow-600 text-white rounded-lg transition-colors flex items-center gap-2"
+                      >
+                        <span>⏸</span>
+                        <span>Pause</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Resume Indicator */}
+                {!pipelineRunning && canResume && (
+                  <div className="p-4 bg-yellow-50 dark:bg-yellow-900/20 border-l-4 border-yellow-500 rounded-lg no-print mb-4">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className="font-medium text-yellow-900 dark:text-yellow-100">
+                          Analysis Paused
+                        </div>
+                        <div className="text-sm text-yellow-700 dark:text-yellow-300 mt-1">
+                          Agent 1 completed. Click Resume to continue with strategic analysis.
+                        </div>
+                      </div>
+
+                      {/* Resume Button */}
+                      <button
+                        onClick={resumePipeline}
+                        className="ml-4 px-4 py-2 bg-green-500 hover:bg-green-600 text-white rounded-lg transition-colors flex items-center gap-2"
+                      >
+                        <span>▶</span>
+                        <span>Resume</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Error State with Retry - hidden in print */}
+                {error && !isLoading && !pipelineRunning && (
+                  <div className="p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg no-print">
+                    <div className="flex items-start gap-3">
+                      <svg className="h-5 w-5 text-red-500 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                      <div className="flex-1">
+                        <p className="text-red-700 dark:text-red-400 font-medium">
+                          {pipelineState.error ? "Pipeline failed" : "Analysis failed"}
+                        </p>
+                        <p className="text-red-600 dark:text-red-300 text-sm mt-1">{error}</p>
+                        {pipelineState.currentAgent && (
+                          <p className="text-red-500 text-sm mt-1">
+                            Failed at Agent {pipelineState.currentAgent}
+                          </p>
+                        )}
+                        {retryCount >= MAX_RETRIES && (
+                          <p className="text-red-500 text-sm mt-2">
+                            Multiple retries failed. Try a smaller PDF or check your connection.
+                          </p>
+                        )}
+                        <button
+                          onClick={pipelineState.error ? retryPipeline : handleRetry}
+                          className="mt-3 px-4 py-2 min-h-[44px] bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 transition-colors"
+                        >
+                          Retry {pipelineState.error ? "Pipeline" : "Analysis"}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Product Management Analysis */}
+                {activeTab === 'strategic' && pipelineState.agent2Result && !pipelineRunning && (() => {
+                  const agent2Data: Agent2Response = pipelineState.agent2Result;
+                  return (
+                    <div className="space-y-6 no-print">
+                    {/* Main Analysis */}
+                    <div className="p-6 bg-white dark:bg-stone-800 border border-stone-200 dark:border-stone-700 rounded-lg">
+                      <h2 className="text-2xl font-bold text-stone-900 dark:text-stone-100 mb-6">Product Management Analysis</h2>
+
+                      {/* Executive Summary - Auto-generated */}
+                      <div className="mb-8 p-4 bg-blue-50 dark:bg-blue-900/20 border-l-4 border-blue-600 rounded-r-lg">
+                        <h3 className="text-lg font-bold text-stone-900 dark:text-blue-100 mb-2">Executive Summary</h3>
+                        <p className="text-stone-700 dark:text-stone-300 leading-relaxed">
+                          Strategic fit for this research is <span className="font-semibold">{agent2Data.strategic.internal_assessment.strategic_fit}</span> with {agent2Data.strategic.internal_assessment.capability_overlap_pct}% existing capability overlap.
+                          Market timing is <span className="font-semibold">{agent2Data.strategic.competitive_landscape.market_timing}</span>.
+                          {agent2Data.strategic.product_implications.opportunities.length > 0 && (
+                            <> Top opportunity: {agent2Data.strategic.product_implications.opportunities[0].product_idea}.</>
+                          )}
+                        </p>
+                      </div>
+
+                      {/* Product Opportunities */}
+                      {agent2Data.strategic.product_implications.opportunities.length > 0 && (
+                        <div className="mb-6 p-4 bg-amber-50 dark:bg-amber-900/20 border-l-4 border-amber-600 rounded-r-lg">
+                          <h3 className="text-lg font-bold text-stone-900 dark:text-amber-100 mb-3">Product Opportunities</h3>
+                          <div className="space-y-4">
+                            {agent2Data.strategic.product_implications.opportunities.map((opp, idx) => (
+                              <div key={idx} className="p-3 bg-white dark:bg-stone-800 rounded-lg">
+                                <h4 className="font-semibold text-stone-900 dark:text-stone-100 mb-2">{idx + 1}. {opp.product_idea}</h4>
+                                <div className="space-y-1 text-sm text-stone-700 dark:text-stone-300">
+                                  <p><span className="font-medium">Target:</span> {opp.target_customer}</p>
+                                  <p><span className="font-medium">Value:</span> {opp.value_proposition}</p>
+                                  <p><span className="font-medium">Differentiation:</span> {opp.differentiation}</p>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Build Assessment */}
+                      <div className="mb-6">
+                        <h3 className="text-lg font-bold text-stone-900 dark:text-stone-100 mb-3">Build Assessment</h3>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                            <p className="text-sm font-medium text-stone-900 dark:text-stone-100">Complexity</p>
+                            <span className={`inline-block mt-1 px-2 py-1 text-xs font-semibold rounded ${
+                              agent2Data.strategic.product_implications.build_assessment.technical_complexity === 'LOW' ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' :
+                              agent2Data.strategic.product_implications.build_assessment.technical_complexity === 'MEDIUM' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200' :
+                              'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'
+                            }`}>
+                              {agent2Data.strategic.product_implications.build_assessment.technical_complexity}
+                            </span>
+                          </div>
+                          <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                            <p className="text-sm font-medium text-stone-900 dark:text-stone-100">Timeline</p>
+                            <p className="text-sm text-stone-700 dark:text-stone-300 mt-1">
+                              {agent2Data.strategic.product_implications.build_assessment.estimated_timeline}
+                            </p>
+                          </div>
+                          <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg sm:col-span-2">
+                            <p className="text-sm font-medium text-stone-900 dark:text-stone-100 mb-1">Infrastructure</p>
+                            <p className="text-sm text-stone-700 dark:text-stone-300">
+                              {agent2Data.strategic.product_implications.build_assessment.infrastructure_needs}
+                            </p>
+                          </div>
+                          {agent2Data.strategic.product_implications.build_assessment.key_challenges.length > 0 && (
+                            <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg sm:col-span-2">
+                              <p className="text-sm font-medium text-stone-900 dark:text-stone-100 mb-1">Key Challenges</p>
+                              <ul className="list-disc list-inside space-y-1 text-sm text-stone-700 dark:text-stone-300">
+                                {agent2Data.strategic.product_implications.build_assessment.key_challenges.map((c, i) => (
+                                  <li key={i}>{c}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Market Positioning */}
+                      <div className="mb-6">
+                        <h3 className="text-lg font-bold text-stone-900 dark:text-stone-100 mb-3">Market Positioning</h3>
+                        <div className="space-y-3">
+                          <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                            <p className="text-sm font-medium text-stone-900 dark:text-stone-100 mb-1">Target Segment</p>
+                            <p className="text-sm text-stone-700 dark:text-stone-300">
+                              {agent2Data.strategic.product_implications.market_fit.target_segment}
+                            </p>
+                          </div>
+                          <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                            <p className="text-sm font-medium text-stone-900 dark:text-stone-100 mb-1">Competitive Positioning</p>
+                            <p className="text-sm text-stone-700 dark:text-stone-300">
+                              {agent2Data.strategic.product_implications.market_fit.competitive_positioning}
+                            </p>
+                          </div>
+                          <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                            <p className="text-sm font-medium text-stone-900 dark:text-stone-100 mb-1">Pricing Strategy</p>
+                            <p className="text-sm text-stone-700 dark:text-stone-300">
+                              {agent2Data.strategic.product_implications.market_fit.pricing_strategy}
+                            </p>
+                          </div>
+                          {agent2Data.strategic.product_implications.market_fit.adoption_barriers.length > 0 && (
+                            <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                              <p className="text-sm font-medium text-stone-900 dark:text-stone-100 mb-1">Adoption Barriers</p>
+                              <ul className="list-disc list-inside space-y-1 text-sm text-stone-700 dark:text-stone-300">
+                                {agent2Data.strategic.product_implications.market_fit.adoption_barriers.map((b, i) => (
+                                  <li key={i}>{b}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Strategic Context */}
+                      <div className="mb-6">
+                        <h3 className="text-lg font-bold text-stone-900 dark:text-stone-100 mb-3">Strategic Context</h3>
+                        <div className="space-y-3">
+                          <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                            <div className="flex items-center justify-between mb-2">
+                              <p className="text-sm font-medium text-stone-900 dark:text-stone-100">Strategic Fit</p>
+                              <span className={`px-2 py-1 text-xs font-semibold rounded ${
+                                agent2Data.strategic.internal_assessment.strategic_fit === 'HIGH' ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' :
+                                agent2Data.strategic.internal_assessment.strategic_fit === 'MEDIUM' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200' :
+                                'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'
+                              }`}>
+                                {agent2Data.strategic.internal_assessment.strategic_fit}
+                              </span>
+                            </div>
+                            <p className="text-sm text-stone-700 dark:text-stone-300">
+                              {agent2Data.strategic.internal_assessment.strategic_fit_reasoning}
+                            </p>
+                            <p className="text-xs text-stone-600 dark:text-stone-400 mt-2">
+                              {agent2Data.strategic.internal_assessment.capability_overlap_pct}% capability overlap
+                            </p>
+                          </div>
+                          <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                            <p className="text-sm font-medium text-stone-900 dark:text-stone-100 mb-1">Resource Gap</p>
+                            <p className="text-sm text-stone-700 dark:text-stone-300">
+                              {agent2Data.strategic.internal_assessment.resource_gap}
+                            </p>
+                          </div>
+                          <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                            <div className="flex items-center justify-between mb-2">
+                              <p className="text-sm font-medium text-stone-900 dark:text-stone-100">Market Timing</p>
+                              <span className={`px-2 py-1 text-xs font-semibold rounded ${
+                                agent2Data.strategic.competitive_landscape.market_timing === 'EARLY' ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' :
+                                agent2Data.strategic.competitive_landscape.market_timing === 'ON_TIME' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200' :
+                                agent2Data.strategic.competitive_landscape.market_timing === 'LATE' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200' :
+                                'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'
+                              }`}>
+                                {agent2Data.strategic.competitive_landscape.market_timing}
+                              </span>
+                            </div>
+                            <p className="text-sm text-stone-700 dark:text-stone-300">
+                              {agent2Data.strategic.competitive_landscape.market_timing_reasoning}
+                            </p>
+                          </div>
+                          {agent2Data.strategic.competitive_landscape.differentiation_opportunities.length > 0 && (
+                            <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                              <p className="text-sm font-medium text-stone-900 dark:text-stone-100 mb-1">Differentiation Opportunities</p>
+                              <ul className="list-disc list-inside space-y-1 text-sm text-stone-700 dark:text-stone-300">
+                                {agent2Data.strategic.competitive_landscape.differentiation_opportunities.map((d, i) => (
+                                  <li key={i}>{d}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Risk Assessment */}
+                      <div className="mb-6">
+                        <h3 className="text-lg font-bold text-stone-900 dark:text-stone-100 mb-3">Risk Assessment</h3>
+                        <div className="space-y-3">
+                          {agent2Data.strategic.product_implications.risks.technical.length > 0 && (
+                            <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                              <p className="text-sm font-medium text-stone-900 dark:text-stone-100 mb-1">Technical Risks</p>
+                              <ul className="list-disc list-inside space-y-1 text-sm text-stone-700 dark:text-stone-300">
+                                {agent2Data.strategic.product_implications.risks.technical.map((r, i) => (
+                                  <li key={i}>{r}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                          {agent2Data.strategic.product_implications.risks.market.length > 0 && (
+                            <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                              <p className="text-sm font-medium text-stone-900 dark:text-stone-100 mb-1">Market Risks</p>
+                              <ul className="list-disc list-inside space-y-1 text-sm text-stone-700 dark:text-stone-300">
+                                {agent2Data.strategic.product_implications.risks.market.map((r, i) => (
+                                  <li key={i}>{r}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                          {agent2Data.strategic.product_implications.risks.regulatory.length > 0 && (
+                            <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                              <p className="text-sm font-medium text-stone-900 dark:text-stone-100 mb-1">Regulatory Risks</p>
+                              <ul className="list-disc list-inside space-y-1 text-sm text-stone-700 dark:text-stone-300">
+                                {agent2Data.strategic.product_implications.risks.regulatory.map((r, i) => (
+                                  <li key={i}>{r}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Competitive Landscape */}
+                      {agent2Data.strategic.competitive_landscape.competitor_details.length > 0 && (
+                        <div className="mb-6">
+                          <h3 className="text-lg font-bold text-stone-900 dark:text-stone-100 mb-3">Competitive Landscape</h3>
+                          <div className="space-y-2">
+                            {agent2Data.strategic.competitive_landscape.competitor_details.map((comp, idx) => (
+                              <div key={idx} className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                <h4 className="text-sm font-semibold text-stone-900 dark:text-stone-100">{comp.company}</h4>
+                                <p className="text-xs text-stone-700 dark:text-stone-300 mt-1">
+                                  <span className="font-medium">Status:</span> {comp.status}
+                                  {comp.timeline && <> • <span className="font-medium">Timeline:</span> {comp.timeline}</>}
+                                </p>
+                                {comp.sources.length > 0 && (
+                                  <div className="flex items-center gap-1 mt-1 flex-wrap">
+                                    <span className="text-xs text-stone-500 dark:text-stone-400">Sources:</span>
+                                    {comp.sources.map((source, i) => (
+                                      <a
+                                        key={i}
+                                        href={source}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
+                                      >
+                                        [{i + 1}]
+                                      </a>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Analysis Metadata with Token Breakdown */}
+                    {pipelineState.agent1Result && pipelineState.agent2Result && (
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 p-4 bg-stone-50 dark:bg-stone-800 border border-stone-200 dark:border-stone-700 rounded-lg">
+                      {/* Total Summary */}
+                      <div className="text-center">
+                        <div className="text-sm text-stone-500 dark:text-stone-400">Total Cost</div>
+                        <div className="text-2xl font-bold text-stone-900 dark:text-stone-100">
+                          ${(pipelineState.agent1Result.metadata.cost + pipelineState.agent2Result.metadata.cost).toFixed(4)}
+                        </div>
+                      </div>
+
+                      <div className="text-center">
+                        <div className="text-sm text-stone-500 dark:text-stone-400">Total Time</div>
+                        <div className="text-2xl font-bold text-stone-900 dark:text-stone-100">
+                          {((pipelineState.agent1Result.metadata.duration + pipelineState.agent2Result.metadata.duration) / 1000).toFixed(1)}s
+                        </div>
+                      </div>
+
+                      <div className="text-center">
+                        <div className="text-sm text-stone-500 dark:text-stone-400">Total Tokens</div>
+                        <div className="text-2xl font-bold text-stone-900 dark:text-stone-100">
+                          {(pipelineState.agent1Result.metadata.tokens.total + pipelineState.agent2Result.metadata.tokens.total).toLocaleString()}
+                        </div>
+                      </div>
+
+                      {/* Detailed Breakdown */}
+                      <div className="col-span-1 md:col-span-3 border-t border-stone-200 dark:border-stone-700 pt-4 mt-2">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+                          {/* Agent 1 Details */}
+                          <div className="space-y-1">
+                            <div className="font-medium text-stone-700 dark:text-stone-300">Agent 1 (Claims Extraction)</div>
+                            <div className="text-stone-600 dark:text-stone-400">
+                              <span className="font-mono">{pipelineState.agent1Result.metadata.tokens.input.toLocaleString()}</span> in •
+                              <span className="font-mono ml-1">{pipelineState.agent1Result.metadata.tokens.output.toLocaleString()}</span> out
+                            </div>
+                            <div className="text-stone-500 dark:text-stone-500">
+                              ${pipelineState.agent1Result.metadata.cost.toFixed(4)} • {(pipelineState.agent1Result.metadata.duration / 1000).toFixed(1)}s
+                            </div>
+                          </div>
+
+                          {/* Agent 2 Details */}
+                          <div className="space-y-1">
+                            <div className="font-medium text-stone-700 dark:text-stone-300">Agent 2 (Strategic Analysis)</div>
+                            <div className="text-stone-600 dark:text-stone-400">
+                              <span className="font-mono">{pipelineState.agent2Result.metadata.tokens.input.toLocaleString()}</span> in •
+                              <span className="font-mono ml-1">{pipelineState.agent2Result.metadata.tokens.output.toLocaleString()}</span> out
+                            </div>
+                            <div className="text-stone-500 dark:text-stone-500">
+                              ${pipelineState.agent2Result.metadata.cost.toFixed(4)} • {(pipelineState.agent2Result.metadata.duration / 1000).toFixed(1)}s
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                    )}
+
+                    {/* Expandable Details Section */}
+                    <div className="bg-white dark:bg-stone-800 border border-stone-200 dark:border-stone-700 rounded-lg overflow-hidden">
+                      <button
+                        onClick={() => setExpandedSections(prev => ({ ...prev, details: !prev.details }))}
+                        className="w-full p-4 flex items-center justify-between hover:bg-stone-50 dark:hover:bg-stone-700/50 transition-colors"
+                      >
+                        <div className="flex items-center gap-3">
+                          <svg
+                            className={`h-5 w-5 text-stone-600 dark:text-stone-400 transition-transform ${expandedSections.details ? 'rotate-90' : ''}`}
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7" />
+                          </svg>
+                          <h3 className="text-base font-semibold text-stone-900 dark:text-stone-100">
+                            View Analysis Details
+                          </h3>
+                        </div>
+                        <span className="text-sm text-stone-500 dark:text-stone-400">
+                          {expandedSections.details ? 'Hide' : 'Show'} agent outputs
+                        </span>
+                      </button>
+
+                      {expandedSections.details && (
+                        <div className="border-t border-stone-200 dark:border-stone-700 p-6 space-y-6">
+                          {/* Agent 1: Claims + Excerpts */}
+                          {pipelineState.agent1Result && (
+                            <div>
+                              <h4 className="text-sm font-bold text-stone-900 dark:text-stone-100 mb-3 uppercase tracking-wide">
+                                Agent 1: Claims + Key Excerpts
+                              </h4>
+                              <div className="space-y-3">
+                                <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                  <p className="text-xs font-semibold text-stone-700 dark:text-stone-300 mb-2">Technical Claims ({pipelineState.agent1Result.claims.technical_claims.length})</p>
+                                  <ul className="list-disc list-inside space-y-1 text-xs text-stone-600 dark:text-stone-400">
+                                    {pipelineState.agent1Result.claims.technical_claims.map((claim, idx) => (
+                                      <li key={idx}>{claim}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+                                <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                  <p className="text-xs font-semibold text-stone-700 dark:text-stone-300 mb-2">Performance Claims ({pipelineState.agent1Result.claims.performance_claims.length})</p>
+                                  <ul className="list-disc list-inside space-y-1 text-xs text-stone-600 dark:text-stone-400">
+                                    {pipelineState.agent1Result.claims.performance_claims.map((claim, idx) => (
+                                      <li key={idx}>{claim}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+                                {pipelineState.agent1Result.claims.key_excerpts && pipelineState.agent1Result.claims.key_excerpts.length > 0 && (
+                                  <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                    <p className="text-xs font-semibold text-stone-700 dark:text-stone-300 mb-2">Key Excerpts ({pipelineState.agent1Result.claims.key_excerpts.length})</p>
+                                    <div className="space-y-2">
+                                      {pipelineState.agent1Result.claims.key_excerpts.slice(0, 2).map((excerpt, idx) => (
+                                        <div key={idx} className="text-xs">
+                                          <span className="font-medium text-stone-700 dark:text-stone-300">{excerpt.section}:</span>
+                                          <span className="text-stone-600 dark:text-stone-400"> {excerpt.text.substring(0, 100)}...</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Agent 2: Strategic & Product Analysis */}
+                          {pipelineState.agent2Result && (() => {
+                            const agent2Data: Agent2Response = pipelineState.agent2Result;
+                            return (
+                              <div>
+                              <h4 className="text-sm font-bold text-stone-900 dark:text-stone-100 mb-3 uppercase tracking-wide">
+                                Agent 2: Strategic & Product Analysis
+                              </h4>
+                              <div className="space-y-2">
+                                <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                  <p className="text-xs font-semibold text-stone-700 dark:text-stone-300 mb-1">Strategic Fit</p>
+                                  <div className="flex items-center gap-2">
+                                    <span className={`px-2 py-0.5 text-xs font-semibold rounded ${
+                                      agent2Data.strategic.internal_assessment.strategic_fit === 'HIGH' ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' :
+                                      agent2Data.strategic.internal_assessment.strategic_fit === 'MEDIUM' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200' :
+                                      'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'
+                                    }`}>
+                                      {agent2Data.strategic.internal_assessment.strategic_fit}
+                                    </span>
+                                    <span className="text-xs text-stone-600 dark:text-stone-400">
+                                      {agent2Data.strategic.internal_assessment.capability_overlap_pct}% capability overlap
+                                    </span>
+                                  </div>
+                                </div>
+                                <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                  <p className="text-xs font-semibold text-stone-700 dark:text-stone-300 mb-1">Market Timing</p>
+                                  <span className={`px-2 py-0.5 text-xs font-semibold rounded ${
+                                    agent2Data.strategic.competitive_landscape.market_timing === 'EARLY' ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' :
+                                    agent2Data.strategic.competitive_landscape.market_timing === 'ON_TIME' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200' :
+                                    agent2Data.strategic.competitive_landscape.market_timing === 'LATE' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200' :
+                                    'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'
+                                  }`}>
+                                    {agent2Data.strategic.competitive_landscape.market_timing}
+                                  </span>
+                                </div>
+                                {agent2Data.strategic.product_implications.opportunities.length > 0 && (
+                                  <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                    <p className="text-xs font-semibold text-stone-700 dark:text-stone-300 mb-1">
+                                      Top Product Opportunity
+                                    </p>
+                                    <p className="text-xs text-stone-600 dark:text-stone-400">
+                                      {agent2Data.strategic.product_implications.opportunities[0].product_idea}
+                                    </p>
+                                  </div>
+                                )}
+                              </div>
+                              </div>
+                            );
+                          })()}
+                        </div>
+                      )}
+                    </div>
+
+                {/* Fallback: Show partial results if pipeline stopped after Agent 1 */}
+                {pipelineState.agent1Result && !pipelineState.agent2Result && !pipelineRunning && (
+                  <div className="space-y-4 no-print">
+                    {/* Agent 1: Claims (Collapsible) */}
+                    <div className="bg-white dark:bg-stone-800 border border-stone-200 dark:border-stone-700 rounded-lg overflow-hidden">
+                      <button
+                        onClick={() => setExpandedSections(prev => ({ ...prev, agent1: !prev.agent1 }))}
+                        className="w-full p-4 flex items-center justify-between hover:bg-stone-50 dark:hover:bg-stone-700/50 transition-colors"
+                      >
+                        <div className="flex items-center gap-3">
+                          <svg
+                            className={`h-5 w-5 text-stone-600 dark:text-stone-400 transition-transform ${expandedSections.agent1 ? 'rotate-90' : ''}`}
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7" />
+                          </svg>
+                          <h2 className="text-lg font-semibold text-stone-900 dark:text-stone-100">
+                            Agent 1: Claims Extraction
+                          </h2>
+                        </div>
+                        <div className="flex items-center gap-4 text-sm text-stone-600 dark:text-stone-400">
+                          <span>${pipelineState.agent1Result.metadata.cost.toFixed(4)}</span>
+                        </div>
+                      </button>
+
+                      {expandedSections.agent1 && (
+                        <div className="p-6 pt-0 border-t border-stone-200 dark:border-stone-700">
+                          <div className="space-y-4 mt-4">
+                            <div>
+                              <h3 className="text-sm font-semibold text-stone-800 dark:text-stone-200 mb-2">
+                                Technical Claims ({pipelineState.agent1Result.claims.technical_claims.length})
+                              </h3>
+                              {pipelineState.agent1Result.claims.technical_claims.length > 0 ? (
+                                <ul className="list-disc list-outside ml-5 space-y-1 text-sm text-stone-700 dark:text-stone-300">
+                                  {pipelineState.agent1Result.claims.technical_claims.map((claim, idx) => (
+                                    <li key={idx}>{claim}</li>
+                                  ))}
+                                </ul>
+                              ) : (
+                                <p className="text-sm text-stone-500 dark:text-stone-400 italic">No technical claims found</p>
+                              )}
+                            </div>
+
+                            <div>
+                              <h3 className="text-sm font-semibold text-stone-800 dark:text-stone-200 mb-2">
+                                Performance Claims ({pipelineState.agent1Result.claims.performance_claims.length})
+                              </h3>
+                              {pipelineState.agent1Result.claims.performance_claims.length > 0 ? (
+                                <ul className="list-disc list-outside ml-5 space-y-1 text-sm text-stone-700 dark:text-stone-300">
+                                  {pipelineState.agent1Result.claims.performance_claims.map((claim, idx) => (
+                                    <li key={idx}>{claim}</li>
+                                  ))}
+                                </ul>
+                              ) : (
+                                <p className="text-sm text-stone-500 dark:text-stone-400 italic">No performance claims found</p>
+                              )}
+                            </div>
+
+                            <div>
+                              <h3 className="text-sm font-semibold text-stone-800 dark:text-stone-200 mb-2">
+                                Resource Requirements ({pipelineState.agent1Result.claims.resource_requirements.length})
+                              </h3>
+                              {pipelineState.agent1Result.claims.resource_requirements.length > 0 ? (
+                                <ul className="list-disc list-outside ml-5 space-y-1 text-sm text-stone-700 dark:text-stone-300">
+                                  {pipelineState.agent1Result.claims.resource_requirements.map((claim, idx) => (
+                                    <li key={idx}>{claim}</li>
+                                  ))}
+                                </ul>
+                              ) : (
+                                <p className="text-sm text-stone-500 dark:text-stone-400 italic">No resource requirements found</p>
+                              )}
+                            </div>
+
+                            <div>
+                              <h3 className="text-sm font-semibold text-stone-800 dark:text-stone-200 mb-2">
+                                Capability Claims ({pipelineState.agent1Result.claims.capability_claims.length})
+                              </h3>
+                              {pipelineState.agent1Result.claims.capability_claims.length > 0 ? (
+                                <ul className="list-disc list-outside ml-5 space-y-1 text-sm text-stone-700 dark:text-stone-300">
+                                  {pipelineState.agent1Result.claims.capability_claims.map((claim, idx) => (
+                                    <li key={idx}>{claim}</li>
+                                  ))}
+                                </ul>
+                              ) : (
+                                <p className="text-sm text-stone-500 dark:text-stone-400 italic">No capability claims found</p>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                    {/* Agent 2: Strategic & Product Analysis (Collapsible) */}
+                    {pipelineState.agent2Result && (() => {
+                      const agent2Data: Agent2Response = pipelineState.agent2Result!;
+                      return (
+                        <div className="bg-white dark:bg-stone-800 border border-stone-200 dark:border-stone-700 rounded-lg overflow-hidden">
+                          <button
+                            onClick={() => setExpandedSections(prev => ({ ...prev, agent2: !prev.agent2 }))}
+                            className="w-full p-4 flex items-center justify-between hover:bg-stone-50 dark:hover:bg-stone-700/50 transition-colors"
+                          >
+                            <div className="flex items-center gap-3">
+                              <svg
+                                className={`h-5 w-5 text-stone-600 dark:text-stone-400 transition-transform ${expandedSections.agent2 ? 'rotate-90' : ''}`}
+                                fill="none"
+                                stroke="currentColor"
+                                viewBox="0 0 24 24"
+                              >
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7" />
+                              </svg>
+                              <h2 className="text-lg font-semibold text-stone-900 dark:text-stone-100">
+                                Agent 2: Strategic & Product Analysis
+                              </h2>
+                            </div>
+                            <div className="flex items-center gap-4 text-sm text-stone-600 dark:text-stone-400">
+                              <span>${agent2Data.metadata.cost.toFixed(4)}</span>
+                            </div>
+                          </button>
+
+                        {expandedSections.agent2 && (
+                          <div className="p-6 pt-0 border-t border-stone-200 dark:border-stone-700">
+                            <div className="space-y-6 mt-4">
+                              {/* Product Opportunities - Most Prominent */}
+                              <div className="p-4 bg-amber-50 dark:bg-amber-900/20 border-l-4 border-amber-600 rounded-r-lg">
+                                <h3 className="text-base font-bold text-stone-900 dark:text-amber-100 mb-3">
+                                  Product Opportunities
+                                </h3>
+                                <div className="space-y-4">
+                                  {agent2Data.strategic.product_implications.opportunities.map((opp, idx) => (
+                                    <div key={idx} className="p-3 bg-white dark:bg-stone-800 rounded-lg">
+                                      <h4 className="text-sm font-semibold text-stone-900 dark:text-stone-100 mb-2">
+                                        {opp.product_idea}
+                                      </h4>
+                                      <div className="space-y-1 text-sm text-stone-700 dark:text-stone-300">
+                                        <p><span className="font-medium">Target:</span> {opp.target_customer}</p>
+                                        <p><span className="font-medium">Value:</span> {opp.value_proposition}</p>
+                                        <p><span className="font-medium">Differentiation:</span> {opp.differentiation}</p>
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+
+                              {/* Build Assessment */}
+                              <div>
+                                <h3 className="text-base font-bold text-stone-900 dark:text-stone-100 mb-3">
+                                  Build Feasibility
+                                </h3>
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                                  <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                    <p className="font-medium text-stone-900 dark:text-stone-100">Complexity</p>
+                                    <p className="text-stone-700 dark:text-stone-300">
+                                      {agent2Data.strategic.product_implications.build_assessment.technical_complexity}
+                                    </p>
+                                  </div>
+                                  <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                    <p className="font-medium text-stone-900 dark:text-stone-100">Timeline</p>
+                                    <p className="text-stone-700 dark:text-stone-300">
+                                      {agent2Data.strategic.product_implications.build_assessment.estimated_timeline}
+                                    </p>
+                                  </div>
+                                  <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg sm:col-span-2">
+                                    <p className="font-medium text-stone-900 dark:text-stone-100 mb-1">Team Requirements</p>
+                                    <p className="text-stone-700 dark:text-stone-300">
+                                      {agent2Data.strategic.product_implications.build_assessment.team_requirements}
+                                    </p>
+                                  </div>
+                                  <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg sm:col-span-2">
+                                    <p className="font-medium text-stone-900 dark:text-stone-100 mb-1">Infrastructure</p>
+                                    <p className="text-stone-700 dark:text-stone-300">
+                                      {agent2Data.strategic.product_implications.build_assessment.infrastructure_needs}
+                                    </p>
+                                  </div>
+                                  {agent2Data.strategic.product_implications.build_assessment.key_challenges.length > 0 && (
+                                    <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg sm:col-span-2">
+                                      <p className="font-medium text-stone-900 dark:text-stone-100 mb-1">Key Challenges</p>
+                                      <ul className="list-disc list-inside space-y-1 text-stone-700 dark:text-stone-300">
+                                        {agent2Data.strategic.product_implications.build_assessment.key_challenges.map((c, i) => (
+                                          <li key={i}>{c}</li>
+                                        ))}
+                                      </ul>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+
+                              {/* Market Fit */}
+                              <div>
+                                <h3 className="text-base font-bold text-stone-900 dark:text-stone-100 mb-3">
+                                  Market Fit
+                                </h3>
+                                <div className="space-y-2 text-sm">
+                                  <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                    <p className="font-medium text-stone-900 dark:text-stone-100">Target Segment</p>
+                                    <p className="text-stone-700 dark:text-stone-300">
+                                      {agent2Data.strategic.product_implications.market_fit.target_segment}
+                                    </p>
+                                  </div>
+                                  <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                    <p className="font-medium text-stone-900 dark:text-stone-100">Positioning</p>
+                                    <p className="text-stone-700 dark:text-stone-300">
+                                      {agent2Data.strategic.product_implications.market_fit.competitive_positioning}
+                                    </p>
+                                  </div>
+                                  <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                    <p className="font-medium text-stone-900 dark:text-stone-100">Pricing</p>
+                                    <p className="text-stone-700 dark:text-stone-300">
+                                      {agent2Data.strategic.product_implications.market_fit.pricing_strategy}
+                                    </p>
+                                  </div>
+                                  {agent2Data.strategic.product_implications.market_fit.adoption_barriers.length > 0 && (
+                                    <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                      <p className="font-medium text-stone-900 dark:text-stone-100 mb-1">Adoption Barriers</p>
+                                      <ul className="list-disc list-inside space-y-1 text-stone-700 dark:text-stone-300">
+                                        {agent2Data.strategic.product_implications.market_fit.adoption_barriers.map((b, i) => (
+                                          <li key={i}>{b}</li>
+                                        ))}
+                                      </ul>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+
+                              {/* Risks */}
+                              <div>
+                                <h3 className="text-base font-bold text-stone-900 dark:text-stone-100 mb-3">
+                                  Risk Assessment
+                                </h3>
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                                  {agent2Data.strategic.product_implications.risks.technical.length > 0 && (
+                                    <div className="p-3 bg-red-50 dark:bg-red-900/20 rounded-lg">
+                                      <p className="font-medium text-red-900 dark:text-red-200 mb-1">Technical</p>
+                                      <ul className="list-disc list-inside space-y-1 text-red-800 dark:text-red-300 text-xs">
+                                        {agent2Data.strategic.product_implications.risks.technical.map((r, i) => (
+                                          <li key={i}>{r}</li>
+                                        ))}
+                                      </ul>
+                                    </div>
+                                  )}
+                                  {agent2Data.strategic.product_implications.risks.market.length > 0 && (
+                                    <div className="p-3 bg-yellow-50 dark:bg-yellow-900/20 rounded-lg">
+                                      <p className="font-medium text-yellow-900 dark:text-yellow-200 mb-1">Market</p>
+                                      <ul className="list-disc list-inside space-y-1 text-yellow-800 dark:text-yellow-300 text-xs">
+                                        {agent2Data.strategic.product_implications.risks.market.map((r, i) => (
+                                          <li key={i}>{r}</li>
+                                        ))}
+                                      </ul>
+                                    </div>
+                                  )}
+                                  {agent2Data.strategic.product_implications.risks.regulatory.length > 0 && (
+                                    <div className="p-3 bg-purple-50 dark:bg-purple-900/20 rounded-lg sm:col-span-2">
+                                      <p className="font-medium text-purple-900 dark:text-purple-200 mb-1">Regulatory</p>
+                                      <ul className="list-disc list-inside space-y-1 text-purple-800 dark:text-purple-300 text-xs">
+                                        {agent2Data.strategic.product_implications.risks.regulatory.map((r, i) => (
+                                          <li key={i}>{r}</li>
+                                        ))}
+                                      </ul>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+
+                              {/* Internal Assessment */}
+                              <div>
+                                <h3 className="text-base font-bold text-stone-900 dark:text-stone-100 mb-3">
+                                  Internal Assessment
+                                </h3>
+                                <div className="space-y-2 text-sm">
+                                  <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                    <p className="font-medium text-stone-900 dark:text-stone-100">Existing Capabilities</p>
+                                    <p className="text-stone-700 dark:text-stone-300">
+                                      {agent2Data.strategic.internal_assessment.existing_capabilities}
+                                    </p>
+                                  </div>
+                                  <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                    <p className="font-medium text-stone-900 dark:text-stone-100">Capability Overlap</p>
+                                    <div className="flex items-center gap-3 mt-1">
+                                      <div className="flex-1 bg-stone-200 dark:bg-stone-700 rounded-full h-2">
+                                        <div
+                                          className="bg-blue-600 h-2 rounded-full"
+                                          style={{ width: `${agent2Data.strategic.internal_assessment.capability_overlap_pct}%` }}
+                                        />
+                                      </div>
+                                      <span className="text-stone-900 dark:text-stone-100 font-semibold">
+                                        {agent2Data.strategic.internal_assessment.capability_overlap_pct}%
+                                      </span>
+                                    </div>
+                                  </div>
+                                  <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                    <div className="flex items-center justify-between mb-1">
+                                      <p className="font-medium text-stone-900 dark:text-stone-100">Strategic Fit</p>
+                                      <span className={`px-2 py-1 text-xs font-semibold rounded ${
+                                        agent2Data.strategic.internal_assessment.strategic_fit === 'HIGH' ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' :
+                                        agent2Data.strategic.internal_assessment.strategic_fit === 'MEDIUM' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200' :
+                                        'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'
+                                      }`}>
+                                        {agent2Data.strategic.internal_assessment.strategic_fit}
+                                      </span>
+                                    </div>
+                                    <p className="text-stone-700 dark:text-stone-300">
+                                      {agent2Data.strategic.internal_assessment.strategic_fit_reasoning}
+                                    </p>
+                                  </div>
+                                  <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                    <p className="font-medium text-stone-900 dark:text-stone-100">Resource Gap</p>
+                                    <p className="text-stone-700 dark:text-stone-300">
+                                      {agent2Data.strategic.internal_assessment.resource_gap}
+                                    </p>
+                                  </div>
+                                </div>
+                              </div>
+
+                              {/* Competitive Landscape */}
+                              <div>
+                                <h3 className="text-base font-bold text-stone-900 dark:text-stone-100 mb-3">
+                                  Competitive Landscape
+                                </h3>
+                                <div className="space-y-2 text-sm">
+                                  {agent2Data.strategic.competitive_landscape.competitor_details.map((comp, idx) => (
+                                    <div key={idx} className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                      <h4 className="font-semibold text-stone-900 dark:text-stone-100 mb-1">{comp.company}</h4>
+                                      <p className="text-stone-700 dark:text-stone-300 mb-1">
+                                        <span className="font-medium">Status:</span> {comp.status}
+                                      </p>
+                                      <p className="text-stone-700 dark:text-stone-300 mb-1">
+                                        <span className="font-medium">Timeline:</span> {comp.timeline}
+                                      </p>
+                                      {comp.sources.length > 0 && (
+                                        <div className="flex items-center gap-1 text-xs text-stone-500">
+                                          <span>Sources:</span>
+                                          {comp.sources.map((source, i) => (
+                                            <a
+                                              key={i}
+                                              href={source}
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              className="text-blue-600 dark:text-blue-400 hover:underline"
+                                            >
+                                              [{i + 1}]
+                                            </a>
+                                          ))}
+                                        </div>
+                                      )}
+                                    </div>
+                                  ))}
+                                  <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                    <div className="flex items-center justify-between mb-1">
+                                      <p className="font-medium text-stone-900 dark:text-stone-100">Market Timing</p>
+                                      <span className={`px-2 py-1 text-xs font-semibold rounded ${
+                                        agent2Data.strategic.competitive_landscape.market_timing === 'EARLY' ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' :
+                                        agent2Data.strategic.competitive_landscape.market_timing === 'ON_TIME' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200' :
+                                        agent2Data.strategic.competitive_landscape.market_timing === 'LATE' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200' :
+                                        'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'
+                                      }`}>
+                                        {agent2Data.strategic.competitive_landscape.market_timing}
+                                      </span>
+                                    </div>
+                                    <p className="text-stone-700 dark:text-stone-300">
+                                      {agent2Data.strategic.competitive_landscape.market_timing_reasoning}
+                                    </p>
+                                  </div>
+                                  {agent2Data.strategic.competitive_landscape.differentiation_opportunities.length > 0 && (
+                                    <div className="p-3 bg-stone-50 dark:bg-stone-900 rounded-lg">
+                                      <p className="font-medium text-stone-900 dark:text-stone-100 mb-1">Differentiation Opportunities</p>
+                                      <ul className="list-disc list-inside space-y-1 text-stone-700 dark:text-stone-300">
+                                        {agent2Data.strategic.competitive_landscape.differentiation_opportunities.map((d, i) => (
+                                          <li key={i}>{d}</li>
+                                        ))}
+                                      </ul>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                        </div>
+                      );
+                    })()}
+
+                    {/* Cost Summary */}
+                    <div className="p-4 bg-stone-50 dark:bg-stone-900 border border-stone-200 dark:border-stone-700 rounded-lg">
+                      <div className="space-y-2 text-sm">
+                        {pipelineState.agent1Result && (
+                          <div className="flex items-center justify-between">
+                            <span className="text-stone-600 dark:text-stone-400">Agent 1 (Claims & Excerpts)</span>
+                            <span className="font-medium text-stone-900 dark:text-stone-100">
+                              ${pipelineState.agent1Result.metadata.cost.toFixed(4)}
+                            </span>
+                          </div>
+                        )}
+                        {pipelineState.agent2Result && (
+                          <div className="flex items-center justify-between">
+                            <span className="text-stone-600 dark:text-stone-400">Agent 2 (Strategic & Product)</span>
+                            <span className="font-medium text-stone-900 dark:text-stone-100">
+                              ${pipelineState.agent2Result.metadata.cost.toFixed(4)}
+                            </span>
+                          </div>
+                        )}
+                        <div className="flex items-center justify-between pt-2 border-t border-stone-200 dark:border-stone-700">
+                          <span className="font-semibold text-stone-900 dark:text-stone-100">Total This Run</span>
+                          <span className="font-bold text-stone-900 dark:text-stone-100">
+                            ${(
+                              pipelineState.agent1Result.metadata.cost +
+                              (pipelineState.agent2Result?.metadata.cost || 0)
+                            ).toFixed(4)}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-stone-600 dark:text-stone-400">Total All Time</span>
+                          <span className="font-semibold text-stone-900 dark:text-stone-100">
+                            ${pipelineState.totalCost.toFixed(4)}
+                            {pipelineState.totalCost > 5 && (
+                              <span className="ml-2 text-xs text-amber-600 dark:text-amber-400">
+                                ({((pipelineState.totalCost / 10) * 100).toFixed(0)}% of $10)
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                        {pipelineState.totalCost >= 9 && (
+                          <div className="mt-2 p-2 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded text-xs text-amber-700 dark:text-amber-300">
+                            Warning: Approaching $10 budget limit
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Analysis Results */}
+                {activeTab === 'quick' && analysis && (
+                  <div className="analysis-results p-6 bg-white dark:bg-stone-800 border border-stone-200 dark:border-stone-700 rounded-lg">
+                    <div className="flex items-center justify-between mb-6 no-print">
+                      <h2 className="text-lg font-semibold text-stone-900 dark:text-stone-100">Analysis Results</h2>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={handleShare}
+                          className="px-3 py-1.5 text-sm text-[#D97757] hover:text-[#C4684A] font-medium"
+                        >
+                          Share
+                        </button>
+                        <div className="relative">
+                          <button
+                            onClick={() => setShowExportMenu(!showExportMenu)}
+                            className="px-3 py-1.5 text-sm bg-stone-100 dark:bg-stone-700 text-stone-700 dark:text-stone-300 rounded-lg hover:bg-stone-200 dark:hover:bg-stone-600 font-medium flex items-center gap-1"
+                          >
+                            Export
+                            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" />
+                            </svg>
+                          </button>
+                          {showExportMenu && (
+                            <div className="absolute right-0 mt-1 w-48 bg-white dark:bg-stone-800 border border-stone-200 dark:border-stone-700 rounded-lg shadow-lg z-10">
+                              <button
+                                onClick={exportMarkdown}
+                                className="w-full text-left px-4 py-2 text-sm text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-700"
+                              >
+                                Download as Markdown
+                              </button>
+                              <button
+                                onClick={exportPdf}
+                                className="w-full text-left px-4 py-2 text-sm text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-700"
+                              >
+                                Save as PDF (Print)
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="text-base leading-relaxed">
+                      <ReactMarkdown
+                        components={{
+                          h1: ({ children }) => (
+                            <h1 className="text-2xl font-bold text-stone-900 dark:text-stone-100 mt-8 mb-4 pb-2 border-b border-stone-200 dark:border-stone-700">{children}</h1>
+                          ),
+                          h2: ({ children }) => {
+                            const text = String(children).toLowerCase();
+                            const isImplications = text.includes("implication") || text.includes("product");
+                            return isImplications ? (
+                              <div className="mt-8 mb-4 p-4 bg-amber-50 dark:bg-amber-900/20 border-l-4 border-[#D97757] rounded-r-lg print:bg-gray-100">
+                                <h2 className="text-xl font-bold text-stone-900 dark:text-amber-100">{children}</h2>
+                              </div>
+                            ) : (
+                              <h2 className="text-xl font-bold text-stone-900 dark:text-stone-100 mt-8 mb-4">{children}</h2>
+                            );
+                          },
+                          h3: ({ children }) => <h3 className="text-lg font-semibold text-stone-800 dark:text-stone-200 mt-6 mb-3">{children}</h3>,
+                          p: ({ children }) => <p className="text-stone-700 dark:text-stone-300 mb-4 leading-7">{children}</p>,
+                          ul: ({ children }) => <ul className="list-disc list-outside ml-6 mb-4 space-y-2 text-stone-700 dark:text-stone-300">{children}</ul>,
+                          ol: ({ children }) => <ol className="list-decimal list-outside ml-6 mb-4 space-y-2 text-stone-700 dark:text-stone-300">{children}</ol>,
+                          li: ({ children }) => <li className="leading-7 pl-2">{children}</li>,
+                          strong: ({ children }) => <strong className="font-semibold text-stone-900 dark:text-stone-100">{children}</strong>,
+                          blockquote: ({ children }) => <blockquote className="border-l-4 border-[#D97757] pl-4 my-4 italic text-stone-600 dark:text-stone-400">{children}</blockquote>,
+                        }}
+                      >
+                        {analysis}
+                      </ReactMarkdown>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </main>
+
+          {/* Right Sidebar - Desktop */}
+          <aside className="hidden lg:block fixed right-0 top-0 w-[300px] h-screen bg-white dark:bg-stone-800 border-l border-stone-200 dark:border-stone-700 p-4 overflow-y-auto no-print">
+            <h2 className="text-sm font-semibold text-stone-700 dark:text-stone-300 mb-3">Recent Analyses</h2>
+            {recentHistory.length === 0 ? (
+              <p className="text-sm text-stone-500">No analyses yet</p>
+            ) : (
+              <div className="space-y-2">
+                {recentHistory.map((item) => (
+                  <button
+                    key={item.id}
+                    onClick={() => loadFromHistory(item)}
+                    className="w-full text-left p-2 rounded-lg hover:bg-stone-100 dark:hover:bg-stone-700 transition-colors"
+                  >
+                    <div className="text-xs text-stone-400 mb-1">{getRelativeTime(item.timestamp)}</div>
+                    <div className="text-sm font-medium text-stone-700 dark:text-stone-300 truncate">{item.filename}</div>
+                    <div className="text-xs text-stone-500 dark:text-stone-400 truncate">{item.titlePreview}</div>
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="mt-4 space-y-2">
+              <button onClick={() => setShowHistoryModal(true)} className="w-full text-sm text-[#D97757] hover:text-[#C4684A] font-medium">
+                View All History
+              </button>
+              {history.length > 0 && (
+                <button onClick={() => setShowClearConfirm(true)} className="w-full text-sm text-stone-500 hover:text-red-600 dark:hover:text-red-400">
+                  Clear History
+                </button>
+              )}
+            </div>
+          </aside>
+        </div>
+
+        {/* Mobile Sidebar Overlay */}
+        {showMobileSidebar && (
+          <div className="fixed inset-0 bg-black/50 z-50 lg:hidden" onClick={() => setShowMobileSidebar(false)}>
+            <div className="absolute right-0 top-0 w-full max-w-sm h-full bg-white dark:bg-stone-800 p-4 overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-lg font-semibold text-stone-900 dark:text-stone-100">History</h2>
+                <button onClick={() => setShowMobileSidebar(false)} className="p-2 text-stone-400 hover:text-stone-600">
+                  <svg className="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+              {history.length === 0 ? (
+                <p className="text-sm text-stone-500 py-4">No analyses yet</p>
+              ) : (
+                <div className="space-y-3">
+                  {history.slice(0, 10).map((item) => (
+                    <button
+                      key={item.id}
+                      onClick={() => loadFromHistory(item)}
+                      className="w-full text-left p-3 rounded-lg hover:bg-stone-100 dark:hover:bg-stone-700 border border-stone-200 dark:border-stone-700"
+                    >
+                      <div className="text-xs text-stone-400 mb-1">{getRelativeTime(item.timestamp)}</div>
+                      <div className="text-sm font-medium text-stone-700 dark:text-stone-300">{item.filename}</div>
+                      <div className="text-xs text-stone-500 dark:text-stone-400 truncate">{item.titlePreview}</div>
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div className="mt-4 space-y-2">
+                <button onClick={() => { setShowMobileSidebar(false); setShowHistoryModal(true); }} className="w-full py-2 text-sm text-[#D97757] font-medium">
+                  View All History
+                </button>
+                {history.length > 0 && (
+                  <button onClick={() => setShowClearConfirm(true)} className="w-full py-2 text-sm text-stone-500 hover:text-red-600">
+                    Clear History
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* History Modal */}
+        {showHistoryModal && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+            <div className="bg-white dark:bg-stone-800 rounded-lg shadow-xl w-full max-w-2xl max-h-[80vh] flex flex-col">
+              <div className="p-4 border-b border-stone-200 dark:border-stone-700">
+                <div className="flex items-center justify-between mb-4">
+                  <h2 className="text-lg font-semibold text-stone-900 dark:text-stone-100">Analysis History</h2>
+                  <button onClick={() => setShowHistoryModal(false)} className="text-stone-400 hover:text-stone-600">
+                    <svg className="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                </div>
+                <input
+                  type="text"
+                  placeholder="Search history..."
+                  value={historySearch}
+                  onChange={(e) => setHistorySearch(e.target.value)}
+                  className="w-full p-2 border border-stone-300 dark:border-stone-600 rounded-lg bg-white dark:bg-stone-900 text-stone-900 dark:text-stone-100 placeholder-stone-400 text-sm"
+                />
+              </div>
+              <div className="flex-1 overflow-y-auto p-4">
+                {filteredHistory.length === 0 ? (
+                  <p className="text-center text-stone-500 py-8">{history.length === 0 ? "No analysis history yet" : "No results found"}</p>
+                ) : (
+                  <div className="space-y-2">
+                    {filteredHistory.map((item) => (
+                      <button
+                        key={item.id}
+                        onClick={() => loadFromHistory(item)}
+                        className="w-full text-left p-3 rounded-lg hover:bg-stone-100 dark:hover:bg-stone-700 border border-stone-200 dark:border-stone-700"
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-sm font-medium text-stone-700 dark:text-stone-300">{item.filename}</span>
+                          <span className="text-xs text-stone-400">{getRelativeTime(item.timestamp)}</span>
+                        </div>
+                        <div className="text-xs text-stone-500 dark:text-stone-400 truncate mb-1">{item.titlePreview}</div>
+
+                        {/* Token and Cost Display */}
+                        <div className="flex items-center gap-3 text-xs text-stone-600 dark:text-stone-400">
+                          {item.tokens && (
+                            <span className="font-mono">
+                              {item.tokens.total.toLocaleString()} tokens
+                            </span>
+                          )}
+                          {item.cost !== undefined && (
+                            <span>
+                              ${item.cost.toFixed(4)}
+                            </span>
+                          )}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              {history.length > 0 && (
+                <div className="p-4 border-t border-stone-200 dark:border-stone-700">
+                  <button onClick={() => setShowClearConfirm(true)} className="text-sm text-red-600 hover:text-red-700 font-medium">
+                    Clear All History
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Clear Confirmation Modal */}
+        {showClearConfirm && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+            <div className="bg-white dark:bg-stone-800 rounded-lg shadow-xl w-full max-w-sm p-6">
+              <h3 className="text-lg font-semibold text-stone-900 dark:text-stone-100 mb-2">Clear History?</h3>
+              <p className="text-stone-600 dark:text-stone-400 mb-6">Delete all saved analyses? This cannot be undone.</p>
+              <div className="flex gap-3 justify-end">
+                <button
+                  onClick={() => setShowClearConfirm(false)}
+                  className="px-4 py-2 text-sm font-medium text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-700 rounded-lg"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={clearHistory}
+                  className="px-4 py-2 text-sm font-medium bg-red-600 text-white hover:bg-red-700 rounded-lg"
+                >
+                  Delete All
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Clear Analysis Confirmation Modal */}
+        {showClearConfirmAnalysis && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+            <div className="bg-white dark:bg-stone-800 rounded-lg shadow-xl w-full max-w-md p-6">
+              <h3 className="text-lg font-semibold text-stone-900 dark:text-stone-100 mb-2">
+                Start New Analysis?
+              </h3>
+              <p className="text-stone-600 dark:text-stone-400 mb-6">
+                You have existing {activeTab === 'quick' ? 'quick' : 'strategic'} analysis results.
+                Starting a new {pendingAnalysisType} analysis will clear them. Continue?
+              </p>
+              <div className="flex gap-3 justify-end">
+                <button
+                  onClick={() => {
+                    setShowClearConfirmAnalysis(false);
+                    setPendingAnalysisType(null);
+                  }}
+                  className="px-4 py-2 text-sm font-medium text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-700 rounded-lg transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    setShowClearConfirmAnalysis(false);
+                    // Proceed with the pending analysis type
+                    if (pendingAnalysisType === 'quick') {
+                      handleAnalyze(true); // Pass true to skip confirmation check
+                    } else if (pendingAnalysisType === 'strategic') {
+                      // Clear and run pipeline
+                      setAnalysis("");
+                      setPipelineState({
+                        currentAgent: null,
+                        startTime: null,
+                        agent1Result: null,
+                        agent2Result: null,
+                        totalCost: pipelineState.totalCost,
+                        error: null,
+                      });
+                      // Need to create a version of runMultiAgentAnalysis that skips confirmation
+                      runMultiAgentAnalysisConfirmed();
+                    }
+                  }}
+                  className="px-4 py-2 text-sm font-medium bg-amber-600 text-white hover:bg-amber-700 rounded-lg transition-colors"
+                >
+                  Clear & Continue
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Share Toast */}
+        {showShareToast && (
+          <div className="fixed bottom-4 left-1/2 -translate-x-1/2 bg-stone-900 text-white px-4 py-2 rounded-lg shadow-lg z-50">
+            Link copied to clipboard!
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
