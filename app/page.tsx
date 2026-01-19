@@ -1,13 +1,10 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
-import ReactMarkdown from "react-markdown";
 import {
   HistoryItem,
   SharedItem,
-  Agent1Result,
   Agent1Response,
-  Agent2Result,
   Agent2Response,
   PipelineState,
 } from "./types";
@@ -15,6 +12,8 @@ import {
   formatDate,
   extractPaperTitle,
   cleanPaper,
+  logAgentCost,
+  generateStrategicMarkdown,
 } from "./utils";
 import {
   LoadingSpinner,
@@ -30,14 +29,12 @@ import {
   HistoryModal,
   PipelineStatus,
 } from "./components";
+import { useHistory } from "./hooks";
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
-const HISTORY_KEY = "decoder_history";
 const SHARED_KEY = "decoder_shared";
 const RUNS_REMAINING_KEY = "multi_agent_runs_remaining";
-const MAX_HISTORY_ITEMS = 50;
 const ANALYSIS_TIMEOUT = 90000; // 90 seconds
-const MAX_RETRIES = 3;
 
 export default function Home() {
   const [companyName, setCompanyName] = useState("");
@@ -53,13 +50,6 @@ export default function Home() {
   const [useTextInput, setUseTextInput] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
-
-  // History state
-  const [history, setHistory] = useState<HistoryItem[]>([]);
-  const [showHistoryModal, setShowHistoryModal] = useState(false);
-  const [historySearch, setHistorySearch] = useState("");
-  const [showMobileSidebar, setShowMobileSidebar] = useState(false);
-  const [showClearConfirm, setShowClearConfirm] = useState(false);
 
   // Export state
   const [showExportMenu, setShowExportMenu] = useState(false);
@@ -96,22 +86,74 @@ export default function Home() {
     details: false,
   });
 
+  // History hook with callback for when an item is selected
+  const handleHistoryItemSelected = useCallback((item: HistoryItem) => {
+    setAnalysis(item.analysis);
+    setCompanyName(item.companyContext.companyName || "");
+    setWebsite(item.companyContext.website || "");
+    setDescription(item.companyContext.description || "");
+
+    // Restore pipelineState for multi-agent analyses
+    if (item.metadata?.strategic && item.metadata?.claims) {
+      setPipelineState({
+        currentAgent: null,
+        startTime: null,
+        agent1Result: {
+          claims: item.metadata.claims,
+          metadata: {
+            duration: item.analysisTime || 0,
+            tokens: { input: 0, output: 0, total: 0 },
+            cost: item.cost || 0,
+          },
+        },
+        agent2Result: {
+          strategic: item.metadata.strategic,
+          metadata: {
+            duration: 0,
+            tokens: { input: 0, output: 0, total: 0 },
+            cost: 0,
+          },
+        },
+        totalCost: item.cost || 0,
+        error: null,
+      });
+    } else {
+      // Clear pipelineState for single-agent analyses
+      setPipelineState({
+        currentAgent: null,
+        startTime: null,
+        agent1Result: null,
+        agent2Result: null,
+        totalCost: 0,
+        error: null,
+      });
+    }
+  }, []);
+
+  const {
+    history,
+    recentHistory,
+    filteredHistory,
+    showHistoryModal,
+    setShowHistoryModal,
+    historySearch,
+    setHistorySearch,
+    showMobileSidebar,
+    setShowMobileSidebar,
+    showClearConfirm,
+    setShowClearConfirm,
+    addToHistory,
+    selectItem: selectHistoryItem,
+    clearHistory,
+  } = useHistory({ onItemSelected: handleHistoryItemSelected });
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const pipelineAbortRef = useRef<AbortController | null>(null);
   const elapsedTimeIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Load history from localStorage
+  // Load cost and runs remaining from localStorage
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem(HISTORY_KEY);
-      if (stored) {
-        setHistory(JSON.parse(stored));
-      }
-    } catch {
-      console.warn("Could not load history from localStorage");
-    }
-
     // Load total cost from localStorage
     try {
       const storedCost = localStorage.getItem("total_cost");
@@ -226,125 +268,6 @@ export default function Home() {
       }
     }
   }, [analysis, pipelineState.agent2Result, activeTab]);
-
-  // Save history to localStorage
-  const saveHistory = useCallback((items: HistoryItem[]) => {
-    try {
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(items));
-    } catch (e) {
-      if (e instanceof Error && e.name === "QuotaExceededError") {
-        const reduced = items.slice(0, Math.floor(items.length / 2));
-        try {
-          localStorage.setItem(HISTORY_KEY, JSON.stringify(reduced));
-          setHistory(reduced);
-        } catch {
-          console.warn("localStorage quota exceeded, history not saved");
-        }
-      }
-    }
-  }, []);
-
-  const addToHistory = useCallback(
-    (
-      analysisResult: string,
-      filename: string,
-      metadata?: {
-        claims?: Agent1Result;
-        strategic?: Agent2Result;
-      },
-      cost?: number,
-      analysisTime?: number,
-      tokens?: {
-        agent1: { input: number; output: number; total: number };
-        agent2: { input: number; output: number; total: number };
-        total: number;
-      }
-    ): HistoryItem => {
-      const newItem: HistoryItem = {
-        id: crypto.randomUUID(),
-        timestamp: Date.now(),
-        filename: filename || "Text input",
-        titlePreview: analysisResult
-          ? analysisResult.slice(0, 60).replace(/[#*\n]/g, " ").trim()
-          : "Deeper analysis completed",
-        analysis: analysisResult,
-        companyContext: {
-          companyName: companyName || undefined,
-          website: website || undefined,
-          description: description || undefined,
-        },
-        metadata,
-        cost,
-        analysisTime,
-        tokens,
-      };
-
-      setHistory((prev) => {
-        const updated = [newItem, ...prev].slice(0, MAX_HISTORY_ITEMS);
-        saveHistory(updated);
-        return updated;
-      });
-
-      return newItem;
-    },
-    [companyName, website, description, saveHistory]
-  );
-
-  const loadFromHistory = (item: HistoryItem) => {
-    setAnalysis(item.analysis);
-    setCompanyName(item.companyContext.companyName || "");
-    setWebsite(item.companyContext.website || "");
-    setDescription(item.companyContext.description || "");
-
-    // Restore pipelineState for multi-agent analyses
-    if (item.metadata?.strategic && item.metadata?.claims) {
-      setPipelineState({
-        currentAgent: null,
-        startTime: null,
-        agent1Result: {
-          claims: item.metadata.claims,
-          metadata: {
-            duration: item.analysisTime || 0,
-            tokens: { input: 0, output: 0, total: 0 },
-            cost: item.cost || 0,
-          },
-        },
-        agent2Result: {
-          strategic: item.metadata.strategic,
-          metadata: {
-            duration: 0,
-            tokens: { input: 0, output: 0, total: 0 },
-            cost: 0,
-          },
-        },
-        totalCost: item.cost || 0,
-        error: null,
-      });
-    } else {
-      // Clear pipelineState for single-agent analyses
-      setPipelineState({
-        currentAgent: null,
-        startTime: null,
-        agent1Result: null,
-        agent2Result: null,
-        totalCost: 0,
-        error: null,
-      });
-    }
-
-    setShowHistoryModal(false);
-    setShowMobileSidebar(false);
-  };
-
-  const clearHistory = () => {
-    setHistory([]);
-    try {
-      localStorage.removeItem(HISTORY_KEY);
-    } catch {
-      // Ignore
-    }
-    setShowClearConfirm(false);
-  };
 
   async function handleFileSelect(file: File) {
     if (file.type !== "application/pdf") {
@@ -493,7 +416,11 @@ export default function Home() {
                 setAnalysis(streamedText);
               } else if (data.type === "done") {
                 setCurrentSection("");
-                addToHistory(streamedText, useTextInput ? extractPaperTitle(paperText) : pdfFileName);
+                addToHistory({
+                  analysisResult: streamedText,
+                  filename: useTextInput ? extractPaperTitle(paperText) : pdfFileName,
+                  companyContext: { companyName, website, description },
+                });
                 setRetryCount(0);
               } else if (data.type === "error") {
                 throw new Error(data.error);
@@ -524,23 +451,6 @@ export default function Home() {
 
   function handleRetry() {
     handleAnalyze(true);
-  }
-
-  function logAgentCost(
-    agentName: string,
-    metadata: {
-      tokens: { input: number; output: number; total: number };
-      cost: number;
-      duration: number;
-    }
-  ) {
-    console.log(`=== ${agentName} ===`);
-    console.log(`Input tokens: ${metadata.tokens.input}`);
-    console.log(`Output tokens: ${metadata.tokens.output}`);
-    console.log(`Cost: $${metadata.cost.toFixed(4)}`);
-    console.log(`Duration: ${metadata.duration}ms`);
-    console.log("");
-    return metadata.cost;
   }
 
   async function runMultiAgentAnalysis() {
@@ -726,21 +636,22 @@ export default function Home() {
       const totalRunCost = agent1Data.metadata.cost + agent2Data.metadata.cost;
       const totalRunTime = agent1Data.metadata.duration + agent2Data.metadata.duration;
 
-      addToHistory(
-        "",
-        useTextInput ? extractPaperTitle(paperText) : pdfFileName,
-        {
+      addToHistory({
+        analysisResult: "",
+        filename: useTextInput ? extractPaperTitle(paperText) : pdfFileName,
+        companyContext: { companyName, website, description },
+        metadata: {
           claims: agent1Data.claims,
           strategic: agent2Data.strategic,
         },
-        totalRunCost,
-        totalRunTime,
-        {
+        cost: totalRunCost,
+        analysisTime: totalRunTime,
+        tokens: {
           agent1: agent1Data.metadata.tokens,
           agent2: agent2Data.metadata.tokens,
           total: agent1Data.metadata.tokens.total + agent2Data.metadata.tokens.total,
-        }
-      );
+        },
+      });
 
       sessionStorage.removeItem('pausedPipelineState');
       setCanResume(false);
@@ -898,21 +809,22 @@ export default function Home() {
         ? extractPaperTitle(savedState.paperSource.paperText)
         : savedState.paperSource.pdfFileName;
 
-      addToHistory(
-        "",
-        paperTitle,
-        {
+      addToHistory({
+        analysisResult: "",
+        filename: paperTitle,
+        companyContext: companyContext,
+        metadata: {
           claims: agent1Result.claims,
           strategic: agent2Data.strategic,
         },
-        agent1Result.metadata.cost + agent2Data.metadata.cost,
-        agent1Result.metadata.duration + agent2Data.metadata.duration,
-        {
+        cost: agent1Result.metadata.cost + agent2Data.metadata.cost,
+        analysisTime: agent1Result.metadata.duration + agent2Data.metadata.duration,
+        tokens: {
           agent1: agent1Result.metadata.tokens,
           agent2: agent2Data.metadata.tokens,
           total: agent1Result.metadata.tokens.total + agent2Data.metadata.tokens.total,
-        }
-      );
+        },
+      });
 
     } catch (err: unknown) {
       if (err instanceof Error && err.name === 'AbortError') {
@@ -952,109 +864,6 @@ export default function Home() {
     } catch {
       setError("Failed to create share link");
     }
-  }
-
-  function generateStrategicMarkdown(strategic: Agent2Result): string {
-    const { internal_assessment, competitive_landscape, product_implications } = strategic;
-
-    return `# Executive Summary
-
-## Strategic Fit: ${internal_assessment.strategic_fit}
-
-${internal_assessment.strategic_fit_reasoning}
-
-**Capability Overlap:** ${internal_assessment.capability_overlap_pct}% match with current capabilities
-
----
-
-## Key Findings
-
-### Internal Assessment
-
-**Existing Capabilities:**
-${internal_assessment.existing_capabilities}
-
-**Resource Gap:**
-${internal_assessment.resource_gap}
-
----
-
-### Market Position
-
-**Market Timing:** ${competitive_landscape.market_timing}
-
-${competitive_landscape.market_timing_reasoning}
-
-**Competitors Identified:**
-${competitive_landscape.competitors_found.map(c => `- ${c}`).join('\n')}
-
-**Differentiation Opportunities:**
-${competitive_landscape.differentiation_opportunities.map(o => `- ${o}`).join('\n')}
-
----
-
-## Product Opportunities
-
-${product_implications.opportunities.map((opp, idx) => `
-### ${idx + 1}. ${opp.product_idea}
-
-- **Target Customer:** ${opp.target_customer}
-- **Value Proposition:** ${opp.value_proposition}
-- **Differentiation:** ${opp.differentiation}
-`).join('\n')}
-
----
-
-## Build Assessment
-
-**Technical Complexity:** ${product_implications.build_assessment.technical_complexity}
-**Estimated Timeline:** ${product_implications.build_assessment.estimated_timeline}
-
-**Team Requirements:**
-${product_implications.build_assessment.team_requirements}
-
-**Infrastructure Needs:**
-${product_implications.build_assessment.infrastructure_needs}
-
-**Key Challenges:**
-${product_implications.build_assessment.key_challenges.map(c => `- ${c}`).join('\n')}
-
----
-
-## Market Fit Analysis
-
-**Target Segment:** ${product_implications.market_fit.target_segment}
-
-**Competitive Positioning:** ${product_implications.market_fit.competitive_positioning}
-
-**Pricing Strategy:** ${product_implications.market_fit.pricing_strategy}
-
-**Adoption Barriers:**
-${product_implications.market_fit.adoption_barriers.map(b => `- ${b}`).join('\n')}
-
----
-
-## Risk Assessment
-
-### Technical Risks
-${product_implications.risks.technical.map(r => `- ${r}`).join('\n')}
-
-### Market Risks
-${product_implications.risks.market.map(r => `- ${r}`).join('\n')}
-
-${product_implications.risks.regulatory.length > 0 ? `### Regulatory Risks\n${product_implications.risks.regulatory.map(r => `- ${r}`).join('\n')}` : ''}
-
----
-
-## Competitive Intelligence
-
-${competitive_landscape.competitor_details.map(comp => `
-### ${comp.company}
-- **Status:** ${comp.status}
-- **Timeline:** ${comp.timeline}
-- **Sources:** ${comp.sources.join(', ')}
-`).join('\n')}
-`;
   }
 
   function exportMarkdown() {
@@ -1105,13 +914,6 @@ ${content}
 
   const inputClassName =
     "w-full p-3 border border-stone-300 dark:border-stone-600 rounded-lg bg-white dark:bg-stone-800 text-stone-900 dark:text-stone-100 placeholder-stone-400 focus:ring-2 focus:ring-amber-600 focus:border-transparent";
-
-  const recentHistory = history.slice(0, 10);
-  const filteredHistory = history.filter(
-    (item) =>
-      item.filename.toLowerCase().includes(historySearch.toLowerCase()) ||
-      item.titlePreview.toLowerCase().includes(historySearch.toLowerCase())
-  );
 
   // Suppress unused variable warnings for now
   void pipelinePaused;
@@ -1307,7 +1109,7 @@ ${content}
             history={history}
             recentHistory={recentHistory}
             showMobile={showMobileSidebar}
-            onLoadItem={loadFromHistory}
+            onLoadItem={selectHistoryItem}
             onViewAll={() => setShowHistoryModal(true)}
             onClear={() => setShowClearConfirm(true)}
             onCloseMobile={() => setShowMobileSidebar(false)}
@@ -1321,7 +1123,7 @@ ${content}
           filteredHistory={filteredHistory}
           search={historySearch}
           onSearchChange={setHistorySearch}
-          onLoadItem={loadFromHistory}
+          onLoadItem={selectHistoryItem}
           onClose={() => setShowHistoryModal(false)}
         />
 

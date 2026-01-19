@@ -54,3 +54,124 @@ export function cleanPaper(paperText: string): string {
 
   return cleaned.trim();
 }
+
+export function logAgentCost(
+  agentName: string,
+  metadata: {
+    tokens: { input: number; output: number; total: number };
+    cost: number;
+    duration: number;
+  }
+): number {
+  console.log(`=== ${agentName} ===`);
+  console.log(`Input tokens: ${metadata.tokens.input}`);
+  console.log(`Output tokens: ${metadata.tokens.output}`);
+  console.log(`Cost: $${metadata.cost.toFixed(4)}`);
+  console.log(`Duration: ${metadata.duration}ms`);
+  console.log("");
+  return metadata.cost;
+}
+
+import type { Agent2Result } from "./types";
+
+export function generateStrategicMarkdown(strategic: Agent2Result): string {
+  const { internal_assessment, competitive_landscape, product_implications } = strategic;
+
+  return `# Executive Summary
+
+## Strategic Fit: ${internal_assessment.strategic_fit}
+
+${internal_assessment.strategic_fit_reasoning}
+
+**Capability Overlap:** ${internal_assessment.capability_overlap_pct}% match with current capabilities
+
+---
+
+## Key Findings
+
+### Internal Assessment
+
+**Existing Capabilities:**
+${internal_assessment.existing_capabilities}
+
+**Resource Gap:**
+${internal_assessment.resource_gap}
+
+---
+
+### Market Position
+
+**Market Timing:** ${competitive_landscape.market_timing}
+
+${competitive_landscape.market_timing_reasoning}
+
+**Competitors Identified:**
+${competitive_landscape.competitors_found.map(c => `- ${c}`).join('\n')}
+
+**Differentiation Opportunities:**
+${competitive_landscape.differentiation_opportunities.map(o => `- ${o}`).join('\n')}
+
+---
+
+## Product Opportunities
+
+${product_implications.opportunities.map((opp, idx) => `
+### ${idx + 1}. ${opp.product_idea}
+
+- **Target Customer:** ${opp.target_customer}
+- **Value Proposition:** ${opp.value_proposition}
+- **Differentiation:** ${opp.differentiation}
+`).join('\n')}
+
+---
+
+## Build Assessment
+
+**Technical Complexity:** ${product_implications.build_assessment.technical_complexity}
+**Estimated Timeline:** ${product_implications.build_assessment.estimated_timeline}
+
+**Team Requirements:**
+${product_implications.build_assessment.team_requirements}
+
+**Infrastructure Needs:**
+${product_implications.build_assessment.infrastructure_needs}
+
+**Key Challenges:**
+${product_implications.build_assessment.key_challenges.map(c => `- ${c}`).join('\n')}
+
+---
+
+## Market Fit Analysis
+
+**Target Segment:** ${product_implications.market_fit.target_segment}
+
+**Competitive Positioning:** ${product_implications.market_fit.competitive_positioning}
+
+**Pricing Strategy:** ${product_implications.market_fit.pricing_strategy}
+
+**Adoption Barriers:**
+${product_implications.market_fit.adoption_barriers.map(b => `- ${b}`).join('\n')}
+
+---
+
+## Risk Assessment
+
+### Technical Risks
+${product_implications.risks.technical.map(r => `- ${r}`).join('\n')}
+
+### Market Risks
+${product_implications.risks.market.map(r => `- ${r}`).join('\n')}
+
+${product_implications.risks.regulatory.length > 0 ? `### Regulatory Risks\n${product_implications.risks.regulatory.map(r => `- ${r}`).join('\n')}` : ''}
+
+---
+
+## Competitive Intelligence
+
+${competitive_landscape.competitor_details.map(comp => `
+### ${comp.company}
+- **Status:** ${comp.status}
+- **Timeline:** ${comp.timeline}
+- **Sources:** ${comp.sources.join(', ')}
+`).join('\n')}`;
+}
