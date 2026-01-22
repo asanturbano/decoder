@@ -2,9 +2,6 @@
   "version": 2,
   "framework": "nextjs",
   "buildCommand": "npm run build",
-  "env": {
-    "ANTHROPIC_API_KEY": "@anthropic-api-key"
-  },
   "regions": ["iad1"],
   "headers": [
     {
