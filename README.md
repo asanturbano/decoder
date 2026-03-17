@@ -1,36 +1,62 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Decoder
+
+Decoder is an AI-powered tool that transforms research papers into actionable product insights. Built for product managers, strategists, and executives who need to understand how emerging research impacts their product roadmap and competitive position.
+
+## Features
+
+### Dual Analysis Modes
+
+- **Quick Analysis** — Fast, single-pass analysis that provides a summary, key findings, and basic product implications.
+- **Deeper Analysis** — Multi-agent pipeline that delivers a full strategic breakdown: competitive landscape, build-vs-buy assessment, market opportunity, and risk analysis, all tailored to your company context.
+
+### Multi-Agent Pipeline
+
+The deeper analysis runs a two-stage pipeline:
+
+1. **Agent 1 (Claims & Excerpts Extractor)** — Extracts and categorizes research claims (technical, performance, resource requirements, capabilities) with key text excerpts.
+2. **Agent 2 (Strategic Context + Product Analyzer)** — Produces an executive briefing covering strategic fit, market opportunity, product implications, build assessment, and risk analysis.
+
+### Company Context Integration
+
+Provide your company name, website, and description to receive recommendations tailored to your existing capabilities, including capability overlap scoring.
+
+### Multiple Input Methods
+
+- PDF file upload (drag-and-drop, up to 10MB)
+- Direct text paste for abstracts or excerpts
+
+### Export & Sharing
+
+- Export as Markdown or PDF
+- Generate shareable links (30-day expiration)
+
+### History
+
+- Local storage of all previous analyses
+- Search and filter through past results
+- Pause and resume long-running analyses
+
+## Tech Stack
+
+- **Framework**: Next.js 16 (App Router), React 19, TypeScript
+- **Styling**: Tailwind CSS 4
+- **AI**: Anthropic Claude API
+- **PDF Parsing**: pdfjs-dist (client-side extraction)
+- **Rate Limiting**: Vercel KV
+- **Deployment**: Vercel
 
 ## Getting Started
 
-First, run the development server:
-
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000) to use the app.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Environment Variables
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+You'll need to configure:
 
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- `ANTHROPIC_API_KEY` — Your Anthropic API key
+- Vercel KV credentials (for rate limiting, optional for local dev)
