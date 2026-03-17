@@ -42,8 +42,7 @@ Provide your company name, website, and description to receive recommendations t
 - **Styling**: Tailwind CSS 4
 - **AI**: Anthropic Claude API
 - **PDF Parsing**: pdfjs-dist (client-side extraction)
-- **Rate Limiting**: Vercel KV
-- **Deployment**: Vercel
+- **Rate Limiting**: In-memory
 
 ## Getting Started
 
@@ -59,4 +58,3 @@ Open [http://localhost:3000](http://localhost:3000) to use the app.
 You'll need to configure:
 
 - `ANTHROPIC_API_KEY` — Your Anthropic API key
-- Vercel KV credentials (for rate limiting, optional for local dev)

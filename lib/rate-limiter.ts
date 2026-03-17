@@ -1,5 +1,3 @@
-import { kv } from "@vercel/kv";
-
 interface RateLimitConfig {
   maxRequests: number;
   windowMs: number;
@@ -14,17 +12,15 @@ interface RateLimitResult {
 }
 
 /**
- * IP-based rate limiter using Vercel KV with fallback to in-memory
+ * IP-based rate limiter using in-memory storage
  */
 export class RateLimiter {
-  private memoryStore: Map<string, { count: number; resetAt: number }> = new Map();
-  private dailyCostKey = "rate_limit:daily_cost";
-  private useKV: boolean;
-
-  constructor() {
-    // Check if KV is available (will be true in production)
-    this.useKV = !!process.env.KV_REST_API_URL;
-  }
+  private memoryStore: Map<string, { count: number; resetAt: number }> =
+    new Map();
+  private dailyCost: { amount: number; resetAt: number } = {
+    amount: 0,
+    resetAt: 0,
+  };
 
   async checkLimit(
     identifier: string,
@@ -37,7 +33,7 @@ export class RateLimiter {
     try {
       // Check daily cost cap first
       if (config.costCap) {
-        const dailyCost = await this.getDailyCost();
+        const dailyCost = this.getDailyCost();
         if (dailyCost >= config.costCap) {
           return {
             success: false,
@@ -48,47 +44,12 @@ export class RateLimiter {
         }
       }
 
-      if (this.useKV) {
-        return await this.checkLimitKV(key, config, resetAt);
-      } else {
-        return this.checkLimitMemory(key, config, resetAt);
-      }
+      return this.checkLimitMemory(key, config, resetAt);
     } catch (error) {
       console.error("Rate limit check failed:", error);
       // Fail open - allow request if rate limiter is down
       return { success: true, remaining: config.maxRequests, resetAt };
     }
-  }
-
-  private async checkLimitKV(
-    key: string,
-    config: RateLimitConfig,
-    resetAt: number
-  ): Promise<RateLimitResult> {
-    const count = await kv.incr(key);
-
-    if (count === 1) {
-      // First request - set expiration
-      await kv.pexpire(key, config.windowMs);
-    }
-
-    const ttl = await kv.pttl(key);
-    const actualResetAt = ttl > 0 ? Date.now() + ttl : resetAt;
-
-    if (count > config.maxRequests) {
-      return {
-        success: false,
-        remaining: 0,
-        resetAt: actualResetAt,
-        error: `Rate limit exceeded. Try again in ${Math.ceil(ttl / 60000)} minutes.`,
-      };
-    }
-
-    return {
-      success: true,
-      remaining: config.maxRequests - count,
-      resetAt: actualResetAt,
-    };
   }
 
   private checkLimitMemory(
@@ -125,33 +86,32 @@ export class RateLimiter {
   }
 
   async trackCost(cost: number): Promise<void> {
-    if (!this.useKV) return;
-
-    try {
-      const current = (await kv.get<number>(this.dailyCostKey)) || 0;
-      const updated = current + cost;
-
-      // Set with TTL to end of day
-      const ttl = this.getEndOfDayTimestamp() - Date.now();
-      await kv.set(this.dailyCostKey, updated, { px: ttl });
-    } catch (error) {
-      console.error("Failed to track cost:", error);
+    const now = Date.now();
+    if (now > this.dailyCost.resetAt) {
+      this.dailyCost = {
+        amount: cost,
+        resetAt: this.getEndOfDayTimestamp(),
+      };
+    } else {
+      this.dailyCost.amount += cost;
     }
   }
 
-  async getDailyCost(): Promise<number> {
-    if (!this.useKV) return 0;
-
-    try {
-      return (await kv.get<number>(this.dailyCostKey)) || 0;
-    } catch {
+  getDailyCost(): number {
+    const now = Date.now();
+    if (now > this.dailyCost.resetAt) {
       return 0;
     }
+    return this.dailyCost.amount;
   }
 
   private getEndOfDayTimestamp(): number {
     const now = new Date();
-    const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+    const endOfDay = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() + 1
+    );
     return endOfDay.getTime();
   }
 
